@@ -10,6 +10,7 @@ const mockApiClient: IGoogleHomeApiClient = {
   executeCommand: jest.fn(),
   getDeviceStates: jest.fn(),
   executeCommands: jest.fn(),
+  requestSync: jest.fn(),
 };
 
 // Mock device manager

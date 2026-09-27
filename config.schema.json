@@ -30,6 +30,17 @@
         "type": "string",
         "description": "OAuth 2.0 Refresh Token (obtained during initial setup)"
       },
+      "agentUserId": {
+        "title": "Agent User ID",
+        "type": "string",
+        "required": true,
+        "description": "Third-party user ID required by the Home Graph API (devices:sync, devices:query, devices:requestSync)"
+      },
+      "fulfillmentUrl": {
+        "title": "Fulfillment URL",
+        "type": "string",
+        "description": "Optional HTTPS endpoint that accepts action.devices.EXECUTE intents. The Home Graph API has no execute endpoint, so device commands are sent here when configured."
+      },
       "pollingInterval": {
         "title": "Polling Interval (seconds)",
         "type": "integer",
@@ -144,6 +155,18 @@
           "type": "password",
           "placeholder": "1//0abcdefghijklmnopqrstuvwxyz",
           "description": "Leave empty for initial setup - will be populated after OAuth flow"
+        },
+        {
+          "key": "agentUserId",
+          "type": "string",
+          "placeholder": "1836.15267389",
+          "description": "Required by the Home Graph API. Find it in your Actions on Google project (under Account linking) or your SYNC responses."
+        },
+        {
+          "key": "fulfillmentUrl",
+          "type": "string",
+          "placeholder": "https://example.com/fulfillment",
+          "description": "Optional. Endpoint that accepts action.devices.EXECUTE intents, used to control devices (the Home Graph API cannot execute commands)."
         }
       ]
     },

@@ -54,6 +54,16 @@ export interface PluginConfig {
   clientId: string;
   clientSecret: string;
   refreshToken?: string;
+  /**
+   * Required by the Home Graph API (devices:sync, devices:query, devices:requestSync).
+   * This is the third-party user ID assigned by your smart home Action.
+   */
+  agentUserId?: string;
+  /**
+   * Optional HTTPS fulfillment endpoint that accepts action.devices.EXECUTE intents.
+   * The Home Graph API has no execute endpoint, so commands are posted here instead.
+   */
+  fulfillmentUrl?: string;
   pollingInterval?: number; // Default: 30 seconds
   deviceRefreshInterval?: number; // Default: 60 seconds
   deviceFilter?: {
@@ -97,24 +107,64 @@ export interface GoogleHomeApiDevice {
   type: string;
   traits: string[];
   name: {
-    defaultNames: string[];
-    name: string;
-    nicknames: string[];
+    defaultNames?: string[];
+    name?: string;
+    nicknames?: string[];
   };
-  willReportState: boolean;
+  willReportState?: boolean;
   roomHint?: string;
+  structureHint?: string;
   deviceInfo?: {
     manufacturer: string;
     model: string;
-    hwVersion: string;
-    swVersion: string;
+    hwVersion?: string;
+    swVersion?: string;
   };
   attributes?: Record<string, unknown>;
   customData?: Record<string, unknown>;
 }
 
-export interface GoogleHomeApiResponse {
-  devices: GoogleHomeApiDevice[];
+/**
+ * Home Graph REST API request/response types
+ * https://developers.home.google.com/reference/home-graph/rest
+ */
+
+// POST /v1/devices:sync
+export interface HomeGraphSyncRequest {
+  requestId?: string;
+  agentUserId: string;
+}
+
+export interface HomeGraphSyncResponse {
+  requestId?: string;
+  payload?: {
+    agentUserId?: string;
+    devices?: GoogleHomeApiDevice[];
+  };
+}
+
+// POST /v1/devices:query
+export interface HomeGraphQueryRequest {
+  requestId?: string;
+  agentUserId: string;
+  inputs: Array<{
+    payload: {
+      devices: Array<{ id: string }>;
+    };
+  }>;
+}
+
+export interface HomeGraphQueryResponse {
+  requestId?: string;
+  payload?: {
+    devices?: Record<string, Record<string, unknown>>;
+  };
+}
+
+// POST /v1/devices:requestSync
+export interface HomeGraphRequestSyncRequest {
+  agentUserId: string;
+  async?: boolean;
 }
 
 export interface StateUpdateEvent {

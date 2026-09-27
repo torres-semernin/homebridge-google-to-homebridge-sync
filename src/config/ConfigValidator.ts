@@ -289,6 +289,8 @@ Required Settings:
 
 Optional Settings:
 - refreshToken: OAuth 2.0 Refresh Token (obtained during setup)
+- agentUserId: Third-party user ID required by the Home Graph API
+- fulfillmentUrl: Endpoint accepting action.devices.EXECUTE intents (for controlling devices)
 - pollingInterval: How often to check for changes (5-300 seconds, default: 30)
 - debugMode: Enable detailed logging (default: false)
 
@@ -303,9 +305,9 @@ Custom Names:
 
 Setup Instructions:
 1. Create a Google Cloud Project
-2. Enable the Smart Device Management API
+2. Enable the Home Graph API
 3. Create OAuth 2.0 credentials
-4. Configure the plugin with your credentials
+4. Configure the plugin with your credentials and agentUserId
 5. Complete the OAuth flow to get a refresh token
 
 For detailed setup instructions, visit:

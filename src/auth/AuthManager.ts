@@ -1,6 +1,6 @@
 import { IAuthManager } from '../interfaces';
 import { AuthTokens, PluginConfig } from '../types';
-import { GOOGLE_TOKEN_URL } from '../constants';
+import { GOOGLE_TOKEN_URL, GOOGLE_OAUTH_URL, REQUIRED_SCOPES } from '../constants';
 import axios, { AxiosResponse } from 'axios';
 import { Logger } from 'homebridge';
 
@@ -113,12 +113,12 @@ export class AuthManager implements IAuthManager {
       client_id: this.clientId,
       redirect_uri: redirectUri,
       response_type: 'code',
-      scope: 'https://www.googleapis.com/auth/sdm.service',
+      scope: REQUIRED_SCOPES.join(' '),
       access_type: 'offline',
       prompt: 'consent',
     });
 
-    return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+    return `${GOOGLE_OAUTH_URL}?${params.toString()}`;
   }
 
   /**

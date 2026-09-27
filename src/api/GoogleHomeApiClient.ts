@@ -1,8 +1,37 @@
 import { IGoogleHomeApiClient, IAuthManager } from '../interfaces';
-import { GoogleHomeDevice, DeviceCommand, DeviceState, ApiResponse, GoogleHomeApiDevice, DeviceType, DeviceTrait } from '../types';
-import { GOOGLE_SMART_HOME_API_URL, MAX_RETRY_ATTEMPTS, DEFAULT_RETRY_DELAY } from '../constants';
+import {
+  GoogleHomeDevice,
+  DeviceCommand,
+  DeviceState,
+  ApiResponse,
+  GoogleHomeApiDevice,
+  DeviceType,
+  DeviceTrait,
+  HomeGraphSyncRequest,
+  HomeGraphSyncResponse,
+  HomeGraphQueryRequest,
+  HomeGraphQueryResponse,
+} from '../types';
+import { GOOGLE_HOME_GRAPH_API_URL, MAX_RETRY_ATTEMPTS, DEFAULT_RETRY_DELAY } from '../constants';
 import axios, { AxiosInstance, AxiosResponse, AxiosError } from 'axios';
 import { Logger } from 'homebridge';
+
+export interface GoogleHomeApiClientOptions {
+  /**
+   * Third-party user ID required by devices:sync, devices:query and devices:requestSync.
+   */
+  agentUserId?: string | undefined;
+  /**
+   * Optional HTTPS fulfillment endpoint that accepts action.devices.EXECUTE intents.
+   * The Home Graph API does not expose a command execution endpoint.
+   */
+  fulfillmentUrl?: string | undefined;
+  /**
+   * Retry tuning (defaults from constants; overridable for tests)
+   */
+  maxRetries?: number;
+  baseRetryDelay?: number;
+}
 
 export class GoogleHomeApiClient implements IGoogleHomeApiClient {
   private readonly authManager: IAuthManager;
@@ -10,15 +39,19 @@ export class GoogleHomeApiClient implements IGoogleHomeApiClient {
   private readonly httpClient: AxiosInstance;
   private readonly maxRetries: number;
   private readonly baseRetryDelay: number;
+  private readonly agentUserId?: string | undefined;
+  private readonly fulfillmentUrl?: string | undefined;
 
-  constructor(authManager: IAuthManager, logger: Logger) {
+  constructor(authManager: IAuthManager, logger: Logger, options: GoogleHomeApiClientOptions = {}) {
     this.authManager = authManager;
     this.logger = logger;
-    this.maxRetries = MAX_RETRY_ATTEMPTS;
-    this.baseRetryDelay = DEFAULT_RETRY_DELAY;
+    this.maxRetries = options.maxRetries ?? MAX_RETRY_ATTEMPTS;
+    this.baseRetryDelay = options.baseRetryDelay ?? DEFAULT_RETRY_DELAY;
+    this.agentUserId = options.agentUserId;
+    this.fulfillmentUrl = options.fulfillmentUrl;
 
     this.httpClient = axios.create({
-      baseURL: GOOGLE_SMART_HOME_API_URL,
+      baseURL: GOOGLE_HOME_GRAPH_API_URL,
       timeout: 30000,
       headers: {
         'Content-Type': 'application/json',
@@ -53,200 +86,275 @@ export class GoogleHomeApiClient implements IGoogleHomeApiClient {
   }
 
   async getDevices(): Promise<ApiResponse<GoogleHomeDevice[]>> {
-    return this.executeWithRetry(async () => {
-      try {
-        // Note: This endpoint may vary based on the actual Google Smart Home API
-        // For Device Access API, it would be something like:
-        // GET https://smartdevicemanagement.googleapis.com/v1/enterprises/{enterprise_id}/devices
-        const response: AxiosResponse = await this.httpClient.get('/devices');
-        
-        const devices = this.mapApiDevicesToGoogleHomeDevices(response.data.devices || []);
-        
-        this.logger.info(`Retrieved ${devices.length} devices from Google Home`);
-        
-        return {
-          success: true,
-          data: devices,
-        };
-      } catch (error) {
-        this.logger.error('Failed to retrieve devices:', error);
-        return {
-          success: false,
-          error: {
-            code: 'DEVICE_RETRIEVAL_FAILED',
-            message: 'Failed to retrieve devices from Google Home',
-            details: error,
-          },
-        };
-      }
-    });
+    if (!this.agentUserId) {
+      return this.missingAgentUserIdError('DEVICE_RETRIEVAL_FAILED');
+    }
+
+    try {
+      const devices = await this.executeWithRetry(() => this.fetchDevices());
+      this.logger.info(`Retrieved ${devices.length} devices from Google Home`);
+      return {
+        success: true,
+        data: devices,
+      };
+    } catch (error) {
+      this.logger.error('Failed to retrieve devices:', error);
+      return {
+        success: false,
+        error: {
+          code: 'DEVICE_RETRIEVAL_FAILED',
+          message: 'Failed to retrieve devices from Google Home',
+          details: error,
+        },
+      };
+    }
   }
 
   async getDeviceState(deviceId: string): Promise<ApiResponse<DeviceState>> {
-    return this.executeWithRetry(async () => {
-      try {
-        const response: AxiosResponse = await this.httpClient.get(`/devices/${deviceId}/state`);
-        
-        const state: DeviceState = {
-          online: response.data.online ?? true,
-          ...response.data,
-        };
-        
-        this.logger.debug(`Retrieved state for device ${deviceId}:`, state);
-        
-        return {
-          success: true,
-          data: state,
-        };
-      } catch (error) {
-        this.logger.error(`Failed to get state for device ${deviceId}:`, error);
-        return {
-          success: false,
-          error: {
-            code: 'DEVICE_STATE_FAILED',
-            message: `Failed to get state for device ${deviceId}`,
-            details: error,
-          },
-        };
-      }
-    });
+    const response = await this.getDeviceStates([deviceId]);
+
+    if (response.success && response.data && deviceId in response.data) {
+      return {
+        success: true,
+        data: response.data[deviceId],
+      };
+    }
+
+    return {
+      success: false,
+      error: response.error || {
+        code: 'DEVICE_STATE_FAILED',
+        message: `Failed to get state for device ${deviceId}`,
+      },
+    };
   }
 
   async executeCommand(deviceId: string, command: DeviceCommand): Promise<ApiResponse<void>> {
-    return this.executeWithRetry(async () => {
-      try {
-        const payload = {
-          requestId: this.generateRequestId(),
-          inputs: [{
-            intent: 'action.devices.EXECUTE',
-            payload: {
-              commands: [{
-                devices: [{ id: deviceId }],
-                execution: [{
-                  command: command.command,
-                  params: command.params,
-                }],
-              }],
-            },
-          }],
-        };
+    return this.executeCommands([{ deviceId, command }]);
+  }
 
-        await this.httpClient.post('/devices:executeCommand', payload);
-        
-        this.logger.debug(`Executed command ${command.command} on device ${deviceId}`);
-        
-        return {
-          success: true,
-        };
-      } catch (error) {
-        this.logger.error(`Failed to execute command on device ${deviceId}:`, error);
+  async getDeviceStates(deviceIds: string[]): Promise<ApiResponse<Record<string, DeviceState>>> {
+    if (deviceIds.length === 0) {
+      return {
+        success: true,
+        data: {},
+      };
+    }
+
+    if (!this.agentUserId) {
+      return this.missingAgentUserIdError('DEVICE_STATES_FAILED');
+    }
+
+    try {
+      const states = await this.executeWithRetry(() => this.fetchDeviceStates(deviceIds));
+      this.logger.debug(`Retrieved states for ${deviceIds.length} devices`);
+      return {
+        success: true,
+        data: states,
+      };
+    } catch (error) {
+      this.logger.error('Failed to get device states:', error);
+      return {
+        success: false,
+        error: {
+          code: 'DEVICE_STATES_FAILED',
+          message: 'Failed to get device states',
+          details: error,
+        },
+      };
+    }
+  }
+
+  async executeCommands(commands: Array<{ deviceId: string; command: DeviceCommand }>): Promise<ApiResponse<void>> {
+    if (commands.length === 0) {
+      return {
+        success: true,
+      };
+    }
+
+    // The Home Graph API has no command execution endpoint. EXECUTE intents are
+    // delivered to the fulfillment endpoint of the smart home Action instead.
+    const fulfillmentUrl = this.fulfillmentUrl;
+    if (!fulfillmentUrl) {
+      this.logger.warn(
+        'Cannot execute commands: no fulfillmentUrl configured ' +
+        '(the Home Graph API does not support command execution)',
+      );
+      return {
+        success: false,
+        error: {
+          code: 'COMMAND_EXECUTION_UNSUPPORTED',
+          message: 'Command execution requires a fulfillmentUrl. The Home Graph API does not expose an execute endpoint.',
+        },
+      };
+    }
+
+    const payload = {
+      requestId: this.generateRequestId(),
+      inputs: [{
+        intent: 'action.devices.EXECUTE',
+        payload: {
+          commands: commands.map(({ deviceId, command }) => ({
+            devices: [{ id: deviceId }],
+            execution: [{
+              command: command.command,
+              params: command.params,
+            }],
+          })),
+        },
+      }],
+    };
+
+    try {
+      const response = await this.executeWithRetry(
+        () => this.httpClient.post(fulfillmentUrl, payload),
+      );
+
+      const resultCommands: Array<{ status?: string; errorCode?: string }> =
+        response.data?.payload?.commands || [];
+      const failed = resultCommands.filter(result => result.status === 'ERROR');
+
+      if (failed.length > 0) {
+        this.logger.error(`Execution failed for ${failed.length} command(s):`, failed);
         return {
           success: false,
           error: {
             code: 'COMMAND_EXECUTION_FAILED',
-            message: `Failed to execute command on device ${deviceId}`,
-            details: error,
+            message: `Fulfillment endpoint reported errors for ${failed.length} command(s)`,
+            details: failed,
           },
         };
       }
-    });
+
+      this.logger.debug(`Executed ${commands.length} commands`);
+
+      return {
+        success: true,
+      };
+    } catch (error) {
+      this.logger.error('Failed to execute commands:', error);
+      return {
+        success: false,
+        error: {
+          code: 'COMMANDS_EXECUTION_FAILED',
+          message: 'Failed to execute commands',
+          details: error,
+        },
+      };
+    }
   }
 
-  async getDeviceStates(deviceIds: string[]): Promise<ApiResponse<Record<string, DeviceState>>> {
-    return this.executeWithRetry(async () => {
-      try {
-        const payload = {
-          requestId: this.generateRequestId(),
-          inputs: [{
-            intent: 'action.devices.QUERY',
-            payload: {
-              devices: deviceIds.map(id => ({ id })),
-            },
-          }],
-        };
+  async requestSync(): Promise<ApiResponse<void>> {
+    const agentUserId = this.agentUserId;
+    if (!agentUserId) {
+      return this.missingAgentUserIdError('REQUEST_SYNC_FAILED');
+    }
 
-        const response: AxiosResponse = await this.httpClient.post('/devices:query', payload);
-        
-        const states: Record<string, DeviceState> = {};
-        const devices = response.data.payload?.devices || {};
+    try {
+      // POST https://homegraph.googleapis.com/v1/devices:requestSync
+      await this.executeWithRetry(
+        () => this.httpClient.post('/devices:requestSync', {
+          agentUserId,
+        }),
+      );
 
-        for (const [deviceId, deviceData] of Object.entries(devices)) {
-          const device = deviceData as Record<string, unknown>;
-          states[deviceId] = {
-            online: (device.online as boolean) ?? true,
-            ...device,
-          };
-        }
-        
-        this.logger.debug(`Retrieved states for ${deviceIds.length} devices`);
-        
-        return {
-          success: true,
-          data: states,
-        };
-      } catch (error) {
-        this.logger.error('Failed to get device states:', error);
-        return {
-          success: false,
-          error: {
-            code: 'DEVICE_STATES_FAILED',
-            message: 'Failed to get device states',
-            details: error,
-          },
-        };
-      }
-    });
+      this.logger.debug('Requested SYNC from Google');
+
+      return {
+        success: true,
+      };
+    } catch (error) {
+      this.logger.error('Failed to request sync:', error);
+      return {
+        success: false,
+        error: {
+          code: 'REQUEST_SYNC_FAILED',
+          message: 'Failed to request sync from Google',
+          details: error,
+        },
+      };
+    }
   }
 
-  async executeCommands(commands: Array<{ deviceId: string; command: DeviceCommand }>): Promise<ApiResponse<void>> {
-    return this.executeWithRetry(async () => {
-      try {
-        const payload = {
-          requestId: this.generateRequestId(),
-          inputs: [{
-            intent: 'action.devices.EXECUTE',
-            payload: {
-              commands: commands.map(({ deviceId, command }) => ({
-                devices: [{ id: deviceId }],
-                execution: [{
-                  command: command.command,
-                  params: command.params,
-                }],
-              })),
-            },
-          }],
-        };
+  /**
+   * POST /v1/devices:sync — returns the user's devices from Home Graph
+   */
+  private async fetchDevices(): Promise<GoogleHomeDevice[]> {
+    const request: HomeGraphSyncRequest = {
+      requestId: this.generateRequestId(),
+      agentUserId: this.requireAgentUserId(),
+    };
 
-        await this.httpClient.post('/devices:executeCommand', payload);
-        
-        this.logger.debug(`Executed ${commands.length} commands`);
-        
-        return {
-          success: true,
-        };
-      } catch (error) {
-        this.logger.error('Failed to execute commands:', error);
-        return {
-          success: false,
-          error: {
-            code: 'COMMANDS_EXECUTION_FAILED',
-            message: 'Failed to execute commands',
-            details: error,
-          },
-        };
-      }
-    });
+    const response: AxiosResponse<HomeGraphSyncResponse> =
+      await this.httpClient.post('/devices:sync', request);
+
+    const apiDevices = response.data.payload?.devices || [];
+    return this.mapApiDevicesToGoogleHomeDevices(apiDevices);
+  }
+
+  /**
+   * POST /v1/devices:query — returns the current states for the given devices
+   */
+  private async fetchDeviceStates(deviceIds: string[]): Promise<Record<string, DeviceState>> {
+    const request: HomeGraphQueryRequest = {
+      requestId: this.generateRequestId(),
+      agentUserId: this.requireAgentUserId(),
+      inputs: [{
+        payload: {
+          devices: deviceIds.map(id => ({ id })),
+        },
+      }],
+    };
+
+    const response: AxiosResponse<HomeGraphQueryResponse> =
+      await this.httpClient.post('/devices:query', request);
+
+    const states: Record<string, DeviceState> = {};
+    const devices = response.data.payload?.devices || {};
+
+    for (const [deviceId, deviceData] of Object.entries(devices)) {
+      states[deviceId] = {
+        online: true,
+        ...deviceData,
+      };
+    }
+
+    return states;
+  }
+
+  /**
+   * Returns the configured agentUserId; callers must guard with missingAgentUserIdError first
+   */
+  private requireAgentUserId(): string {
+    if (!this.agentUserId) {
+      throw new Error('agentUserId is required but not configured');
+    }
+    return this.agentUserId;
+  }
+
+  private missingAgentUserIdError<T>(code: string): ApiResponse<T> {
+    this.logger.error(
+      'agentUserId is required by the Home Graph API (devices:sync, devices:query, devices:requestSync) ' +
+      'but is not configured',
+    );
+    return {
+      success: false,
+      error: {
+        code,
+        message: 'Missing required agentUserId configuration for the Home Graph API',
+      },
+    };
   }
 
   private async executeWithRetry<T>(operation: () => Promise<T>): Promise<T> {
     let lastError: Error | null = null;
-    
+
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
         return await operation();
       } catch (error) {
         lastError = error as Error;
-        
+
         if (attempt === this.maxRetries) {
           break;
         }
@@ -262,7 +370,7 @@ export class GoogleHomeApiClient implements IGoogleHomeApiClient {
         }
       }
     }
-    
+
     throw lastError;
   }
 
@@ -295,7 +403,10 @@ export class GoogleHomeApiClient implements IGoogleHomeApiClient {
   private mapApiDevicesToGoogleHomeDevices(apiDevices: GoogleHomeApiDevice[]): GoogleHomeDevice[] {
     return apiDevices.map(apiDevice => ({
       id: apiDevice.id,
-      name: apiDevice.name.name || apiDevice.name.defaultNames[0] || 'Unknown Device',
+      name: apiDevice.name?.name ||
+        apiDevice.name?.defaultNames?.[0] ||
+        apiDevice.name?.nicknames?.[0] ||
+        'Unknown Device',
       type: this.mapDeviceType(apiDevice.type),
       traits: apiDevice.traits.map(trait => this.mapDeviceTrait(trait)),
       attributes: apiDevice.attributes || {},
@@ -365,6 +476,16 @@ export class GoogleHomeApiClient implements IGoogleHomeApiClient {
       return DeviceTrait.START_STOP;
     case 'action.devices.traits.Volume':
       return DeviceTrait.VOLUME;
+    case 'action.devices.traits.OpenClose':
+      return DeviceTrait.OPEN_CLOSE;
+    case 'action.devices.traits.HumiditySetting':
+      return DeviceTrait.HUMIDITY_SETTING;
+    case 'action.devices.traits.EnergyStorage':
+      return DeviceTrait.ENERGY_STORAGE;
+    case 'action.devices.traits.Modes':
+      return DeviceTrait.MODES;
+    case 'action.devices.traits.Toggles':
+      return DeviceTrait.TOGGLES;
     default:
       this.logger.warn(`Unknown device trait: ${apiTrait}`);
       return DeviceTrait.ON_OFF; // Default fallback

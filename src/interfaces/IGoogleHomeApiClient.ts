@@ -25,4 +25,9 @@ export interface IGoogleHomeApiClient {
    * Execute commands on multiple devices
    */
   executeCommands(commands: Array<{ deviceId: string; command: DeviceCommand }>): Promise<ApiResponse<void>>;
+
+  /**
+   * Request a new SYNC from Google (POST /v1/devices:requestSync)
+   */
+  requestSync(): Promise<ApiResponse<void>>;
 }

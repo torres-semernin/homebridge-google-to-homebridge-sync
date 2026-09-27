@@ -284,10 +284,25 @@ export class ResilientApiClient implements IGoogleHomeApiClient {
     }
   }
 
+  async requestSync(): Promise<ApiResponse<void>> {
+    try {
+      return await this.baseClient.requestSync();
+    } catch (error) {
+      this.logger.error('Error requesting sync:', error);
+      return {
+        success: false,
+        error: {
+          code: 'REQUEST_SYNC_FAILED',
+          message: 'Failed to request sync from Google',
+          details: error,
+        },
+      };
+    }
+  }
+
   /**
    * Optimistically update cached state based on executed command
-   */
-  private updateCachedStateFromCommand(deviceId: string, command: DeviceCommand): void {
+   */  private updateCachedStateFromCommand(deviceId: string, command: DeviceCommand): void {
     const cachedState = this.stateCache.getDeviceState(deviceId);
     if (!cachedState) {
       return; // No cached state to update
