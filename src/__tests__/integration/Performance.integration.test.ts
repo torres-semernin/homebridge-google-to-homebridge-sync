@@ -1,7 +1,7 @@
 import { API, Logger, PlatformConfig } from 'homebridge';
 import { GoogleHomePlatform } from '../../platform';
 import { PLATFORM_NAME } from '../../constants';
-import { GoogleHomeDevice, DeviceType } from '../../types';
+import { GoogleHomeDevice, DeviceType, DeviceTrait } from '../../types';
 
 // Performance test utilities
 class PerformanceMonitor {
@@ -16,7 +16,7 @@ class PerformanceMonitor {
   end(): { duration: number; memoryDelta: NodeJS.MemoryUsage } {
     const endTime = Date.now();
     const memoryEnd = process.memoryUsage();
-    
+
     const duration = endTime - this.startTime;
     const memoryDelta = {
       rss: memoryEnd.rss - (this.memoryStart?.rss || 0),
@@ -32,8 +32,10 @@ class PerformanceMonitor {
 
 // Mock implementations for performance testing
 const createMockAPI = () => ({
+  on: jest.fn(),
   hap: {
     Service: {
+      AccessoryInformation: 'AccessoryInformation',
       Lightbulb: 'Lightbulb',
       Switch: 'Switch',
       Outlet: 'Outlet',
@@ -67,18 +69,23 @@ const createMockAPI = () => ({
     UUID: uuid,
     context: {},
     services: [],
-    addService: jest.fn().mockReturnValue({
+    addService: jest.fn().mockImplementation(() => ({
       setCharacteristic: jest.fn().mockReturnThis(),
       getCharacteristic: jest.fn().mockReturnValue({
         on: jest.fn().mockReturnThis(),
+        onGet: jest.fn().mockReturnThis(),
+        onSet: jest.fn().mockReturnThis(),
         updateValue: jest.fn().mockReturnThis(),
         setProps: jest.fn().mockReturnThis(),
       }),
-    }),
+    })),
     getService: jest.fn(),
     removeService: jest.fn(),
   })),
   registerPlatform: jest.fn(),
+  registerPlatformAccessories: jest.fn(),
+  updatePlatformAccessories: jest.fn(),
+  unregisterPlatformAccessories: jest.fn(),
 }) as unknown as API;
 
 const createMockLogger = () => ({
@@ -115,24 +122,24 @@ const generateMockDevices = (count: number): GoogleHomeDevice[] => {
   });
 };
 
-const getTraitsForDeviceType = (deviceType: DeviceType): string[] => {
+const getTraitsForDeviceType = (deviceType: DeviceType): DeviceTrait[] => {
   switch (deviceType) {
     case DeviceType.LIGHT:
-      return ['action.devices.traits.OnOff', 'action.devices.traits.Brightness'];
+      return [DeviceTrait.ON_OFF, DeviceTrait.BRIGHTNESS];
     case DeviceType.SWITCH:
-      return ['action.devices.traits.OnOff'];
+      return [DeviceTrait.ON_OFF];
     case DeviceType.THERMOSTAT:
-      return ['action.devices.traits.TemperatureSetting'];
+      return [DeviceTrait.TEMPERATURE_SETTING];
     case DeviceType.CAMERA:
-      return ['action.devices.traits.CameraStream'];
+      return [DeviceTrait.CAMERA_STREAM];
     case DeviceType.SENSOR:
-      return ['action.devices.traits.SensorState'];
+      return [DeviceTrait.SENSOR_STATE];
     default:
-      return ['action.devices.traits.OnOff'];
+      return [DeviceTrait.ON_OFF];
   }
 };
 
-const getAttributesForDeviceType = (deviceType: DeviceType): Record<string, any> => {
+const getAttributesForDeviceType = (deviceType: DeviceType): Record<string, unknown> => {
   switch (deviceType) {
     case DeviceType.THERMOSTAT:
       return {
@@ -158,7 +165,7 @@ const getAttributesForDeviceType = (deviceType: DeviceType): Record<string, any>
   }
 };
 
-const getStateForDeviceType = (deviceType: DeviceType, index: number): Record<string, any> => {
+const getStateForDeviceType = (deviceType: DeviceType, index: number): Record<string, unknown> => {
   switch (deviceType) {
     case DeviceType.LIGHT:
       return { on: index % 2 === 0, brightness: 50 + (index % 50) };
@@ -192,13 +199,38 @@ describe('Performance Integration Tests', () => {
   let mockLogger: Logger;
   let mockConfig: PlatformConfig;
   let performanceMonitor: PerformanceMonitor;
+  const platforms: GoogleHomePlatform[] = [];
+
+  const setupPlatform = (devices: GoogleHomeDevice[]): GoogleHomePlatform => {
+    const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
+    platforms.push(platform);
+
+    jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
+    jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue({
+      accessToken: 'test-access-token',
+      refreshToken: 'test-refresh-token',
+      expiresAt: Date.now() + 3600000,
+    });
+    jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue({
+      success: true,
+      data: devices,
+    });
+    // Keep background polling hermetic
+    jest.spyOn(platform.apiClient, 'getDeviceStates').mockResolvedValue({
+      success: true,
+      data: {},
+    });
+
+    return platform;
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
+    platforms.length = 0;
     mockAPI = createMockAPI();
     mockLogger = createMockLogger();
     performanceMonitor = new PerformanceMonitor();
-    
+
     mockConfig = {
       platform: PLATFORM_NAME,
       name: 'Performance Test',
@@ -209,17 +241,19 @@ describe('Performance Integration Tests', () => {
     };
   });
 
+  afterEach(() => {
+    for (const platform of platforms) {
+      platform.stateSyncManager.stopPolling();
+      platform.deviceManager.stopDeviceLifecycleMonitoring();
+    }
+  });
+
   describe('Device Discovery Performance', () => {
     it('should handle 10 devices within performance thresholds', async () => {
       const deviceCount = 10;
       const mockDevices = generateMockDevices(deviceCount);
-      
-      const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
-      
-      // Setup mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
+
+      const platform = setupPlatform(mockDevices);
 
       performanceMonitor.start();
       await platform.discoverDevices();
@@ -234,13 +268,8 @@ describe('Performance Integration Tests', () => {
     it('should handle 50 devices within performance thresholds', async () => {
       const deviceCount = 50;
       const mockDevices = generateMockDevices(deviceCount);
-      
-      const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
-      
-      // Setup mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
+
+      const platform = setupPlatform(mockDevices);
 
       performanceMonitor.start();
       await platform.discoverDevices();
@@ -255,13 +284,8 @@ describe('Performance Integration Tests', () => {
     it('should handle 100 devices within performance thresholds', async () => {
       const deviceCount = 100;
       const mockDevices = generateMockDevices(deviceCount);
-      
-      const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
-      
-      // Setup mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
+
+      const platform = setupPlatform(mockDevices);
 
       performanceMonitor.start();
       await platform.discoverDevices();
@@ -278,13 +302,8 @@ describe('Performance Integration Tests', () => {
     it('should handle concurrent state updates efficiently', async () => {
       const deviceCount = 20;
       const mockDevices = generateMockDevices(deviceCount);
-      
-      const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
-      
-      // Setup mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
+
+      const platform = setupPlatform(mockDevices);
       jest.spyOn(platform.apiClient, 'executeCommand').mockImplementation(async () => {
         // Simulate network delay
         await new Promise(resolve => setTimeout(resolve, 50));
@@ -293,47 +312,40 @@ describe('Performance Integration Tests', () => {
 
       await platform.discoverDevices();
 
-      // Mock state sync manager
-      jest.spyOn(platform.stateSyncManager, 'sendCommand').mockImplementation(async (deviceId, command) => {
-        return await platform.apiClient.executeCommand(deviceId, command);
+      // Mock state sync manager command dispatch
+      jest.spyOn(platform.stateSyncManager, 'sendCommand').mockImplementation(async (deviceId, command, params) => {
+        await platform.apiClient.executeCommand(deviceId, { command, params });
       });
 
       // Create concurrent state update commands
       const commands = mockDevices.map((device, i) => ({
         deviceId: device.id,
-        command: { on: i % 2 === 0 },
+        params: { on: i % 2 === 0 } as Record<string, unknown>,
       }));
 
       performanceMonitor.start();
-      
+
       // Execute all commands concurrently
-      const results = await Promise.all(
-        commands.map(({ deviceId, command }) => 
-          platform.stateSyncManager.sendCommand(deviceId, command)
+      await Promise.all(
+        commands.map(({ deviceId, params }) =>
+          platform.stateSyncManager.sendCommand(deviceId, 'action.devices.commands.OnOff', params)
         )
       );
-      
+
       const { duration } = performanceMonitor.end();
 
       // Performance assertions
       expect(duration).toBeLessThan(2000); // Should complete within 2 seconds due to concurrency
-      expect(results.every(r => r.success)).toBe(true);
       expect(platform.apiClient.executeCommand).toHaveBeenCalledTimes(deviceCount);
     });
 
     it('should maintain performance during continuous polling', async () => {
       const deviceCount = 10;
       const mockDevices = generateMockDevices(deviceCount);
-      
-      const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
-      
-      // Setup mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-      jest.spyOn(platform.apiClient, 'getDeviceState').mockImplementation(async (deviceId) => {
-        const device = mockDevices.find(d => d.id === deviceId);
-        return device?.state || {};
+
+      const platform = setupPlatform(mockDevices);
+      jest.spyOn(platform.apiClient, 'getDeviceState').mockImplementation(async () => {
+        return { success: true, data: { online: true } };
       });
 
       await platform.discoverDevices();
@@ -341,16 +353,16 @@ describe('Performance Integration Tests', () => {
       // Mock polling mechanism
       let pollCount = 0;
       const maxPolls = 5;
-      
+
       jest.spyOn(platform.stateSyncManager, 'startPolling').mockImplementation(() => {
         const pollInterval = setInterval(async () => {
           if (pollCount >= maxPolls) {
             clearInterval(pollInterval);
             return;
           }
-          
+
           pollCount++;
-          
+
           // Simulate polling all devices
           await Promise.all(
             mockDevices.map(device => platform.apiClient.getDeviceState(device.id))
@@ -360,10 +372,10 @@ describe('Performance Integration Tests', () => {
 
       performanceMonitor.start();
       platform.stateSyncManager.startPolling();
-      
+
       // Wait for polling to complete
       await new Promise(resolve => setTimeout(resolve, 600));
-      
+
       const { duration, memoryDelta } = performanceMonitor.end();
 
       // Performance assertions
@@ -377,32 +389,34 @@ describe('Performance Integration Tests', () => {
     it('should not leak memory during device lifecycle operations', async () => {
       const deviceCount = 25;
       let mockDevices = generateMockDevices(deviceCount);
-      
-      const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
-      
-      // Setup mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
+
+      const platform = setupPlatform(mockDevices);
 
       // Initial discovery
       performanceMonitor.start();
       await platform.discoverDevices();
       const initialMetrics = performanceMonitor.end();
+      expect(initialMetrics.duration).toBeLessThan(2000);
 
       // Simulate device removal and addition cycles
       for (let cycle = 0; cycle < 3; cycle++) {
         // Remove half the devices
         mockDevices = mockDevices.slice(0, Math.floor(deviceCount / 2));
-        jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-        
+        jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue({
+          success: true,
+          data: mockDevices,
+        });
+
         await platform.discoverDevices();
-        
+
         // Add new devices
         const newDevices = generateMockDevices(deviceCount);
         mockDevices = [...mockDevices, ...newDevices.slice(Math.floor(deviceCount / 2))];
-        jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-        
+        jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue({
+          success: true,
+          data: mockDevices,
+        });
+
         await platform.discoverDevices();
       }
 
@@ -421,19 +435,14 @@ describe('Performance Integration Tests', () => {
     it('should handle rapid device state changes without memory leaks', async () => {
       const deviceCount = 15;
       const mockDevices = generateMockDevices(deviceCount);
-      
-      const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
-      
-      // Setup mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
+
+      const platform = setupPlatform(mockDevices);
       jest.spyOn(platform.apiClient, 'executeCommand').mockResolvedValue({ success: true });
 
       await platform.discoverDevices();
 
       // Mock rapid state changes
-      jest.spyOn(platform.stateSyncManager, 'sendCommand').mockResolvedValue({ success: true });
+      jest.spyOn(platform.stateSyncManager, 'sendCommand').mockResolvedValue(undefined);
       jest.spyOn(platform.stateSyncManager, 'handleStateChange').mockImplementation(async () => {});
 
       performanceMonitor.start();
@@ -441,8 +450,12 @@ describe('Performance Integration Tests', () => {
       // Simulate 100 rapid state changes
       const stateChanges = Array.from({ length: 100 }, (_, i) => {
         const deviceId = mockDevices[i % deviceCount].id;
-        const newState = { on: i % 2 === 0, brightness: i % 100 };
-        return platform.stateSyncManager.handleStateChange(deviceId, newState);
+        const newState = { online: true, on: i % 2 === 0, brightness: i % 100 };
+        return platform.stateSyncManager.handleStateChange({
+          deviceId,
+          state: newState,
+          timestamp: Date.now(),
+        });
       });
 
       await Promise.all(stateChanges);
@@ -459,9 +472,9 @@ describe('Performance Integration Tests', () => {
     it('should handle authentication retries without significant performance impact', async () => {
       const deviceCount = 10;
       const mockDevices = generateMockDevices(deviceCount);
-      
-      const platform = new GoogleHomePlatform(mockLogger, mockConfig, mockAPI);
-      
+
+      const platform = setupPlatform(mockDevices);
+
       // Setup auth to fail twice, then succeed
       let authAttempts = 0;
       jest.spyOn(platform.authManager, 'authenticate').mockImplementation(async () => {
@@ -469,20 +482,24 @@ describe('Performance Integration Tests', () => {
         if (authAttempts <= 2) {
           throw new Error('Auth failed');
         }
-        return true;
+        return {
+          accessToken: 'test-access-token',
+          refreshToken: 'test-refresh-token',
+          expiresAt: Date.now() + 3600000,
+        };
       });
-      
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(false);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
 
       performanceMonitor.start();
 
-      // First two attempts should fail
-      await expect(platform.discoverDevices()).rejects.toThrow();
-      await expect(platform.discoverDevices()).rejects.toThrow();
+      // First two attempts fail (errors are absorbed and logged by the platform)
+      await platform.discoverDevices();
+      await platform.discoverDevices();
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        'Failed to discover devices:',
+        expect.any(Error)
+      );
 
       // Third attempt should succeed
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
       await platform.discoverDevices();
 
       const { duration } = performanceMonitor.end();
@@ -490,6 +507,7 @@ describe('Performance Integration Tests', () => {
       // Should complete within reasonable time despite retries
       expect(duration).toBeLessThan(3000);
       expect(authAttempts).toBe(3);
+      expect(mockAPI.platformAccessory).toHaveBeenCalledTimes(deviceCount);
     });
   });
 });

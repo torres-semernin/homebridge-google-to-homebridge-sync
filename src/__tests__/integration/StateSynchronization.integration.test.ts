@@ -73,6 +73,9 @@ describe('State Synchronization Integration Tests', () => {
     jest.spyOn(authManager, 'isAuthenticated').mockReturnValue(true);
     jest.spyOn(authManager, 'getValidAccessToken').mockResolvedValue('test-token');
 
+    // Hermetic default: connection checks succeed without real network calls
+    jest.spyOn(baseApiClient, 'getDevices').mockResolvedValue({ success: true, data: [] });
+
     jest.clearAllMocks();
   });
 
@@ -87,8 +90,8 @@ describe('State Synchronization Integration Tests', () => {
       jest.spyOn(baseApiClient, 'getDeviceStates').mockResolvedValue({
         success: true,
         data: {
-          'light-1': { on: true, brightness: 80 },
-          'switch-1': { on: false },
+          'light-1': { online: true, on: true, brightness: 80 },
+          'switch-1': { online: true, on: false },
         },
       });
 
@@ -96,11 +99,11 @@ describe('State Synchronization Integration Tests', () => {
       stateSyncManager.startPolling();
 
       // Wait for initial poll
-      await jest.runOnlyPendingTimersAsync();
+      await jest.advanceTimersByTimeAsync(0);
 
       // Verify device states were updated
-      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('light-1', { on: true, brightness: 80 });
-      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('switch-1', { on: false });
+      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('light-1', { online: true, on: true, brightness: 80 });
+      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('switch-1', { online: true, on: false });
     });
 
     it('should send commands from HomeKit to Google Home', async () => {
@@ -112,7 +115,7 @@ describe('State Synchronization Integration Tests', () => {
       // Mock state refresh after command
       jest.spyOn(baseApiClient, 'getDeviceState').mockResolvedValue({
         success: true,
-        data: { on: true, brightness: 100 },
+        data: { online: true, on: true, brightness: 100 },
       });
 
       // Send command
@@ -157,32 +160,31 @@ describe('State Synchronization Integration Tests', () => {
         .mockResolvedValueOnce({
           success: true,
           data: {
-            'light-1': { on: false, brightness: 50 },
-            'switch-1': { on: true },
+            'light-1': { online: true, on: false, brightness: 50 },
+            'switch-1': { online: true, on: true },
           },
         })
         .mockResolvedValueOnce({
           success: true,
           data: {
-            'light-1': { on: true, brightness: 80 }, // Changed
-            'switch-1': { on: true }, // No change
+            'light-1': { online: true, on: true, brightness: 80 }, // Changed
+            'switch-1': { online: true, on: true }, // No change
           },
         });
 
       stateSyncManager.startPolling();
 
-      // First poll
-      await jest.runOnlyPendingTimersAsync();
+      // First poll (triggered immediately by startPolling)
+      await jest.advanceTimersByTimeAsync(0);
       expect(deviceManager.updateDeviceState).toHaveBeenCalledTimes(2);
 
       jest.clearAllMocks();
 
       // Second poll - should only update changed device
-      jest.advanceTimersByTime(5000);
-      await jest.runOnlyPendingTimersAsync();
+      await jest.advanceTimersByTimeAsync(5000);
 
       expect(deviceManager.updateDeviceState).toHaveBeenCalledTimes(1);
-      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('light-1', { on: true, brightness: 80 });
+      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('light-1', { online: true, on: true, brightness: 80 });
     });
 
     it('should handle polling errors without stopping', async () => {
@@ -198,7 +200,7 @@ describe('State Synchronization Integration Tests', () => {
       stateSyncManager.startPolling();
 
       // Wait for poll attempt
-      await jest.runOnlyPendingTimersAsync();
+      await jest.advanceTimersByTimeAsync(0);
 
       // Should log warning but continue polling
       expect(mockLogger.warn).toHaveBeenCalledWith(
@@ -207,7 +209,7 @@ describe('State Synchronization Integration Tests', () => {
       );
 
       // Verify polling continues
-      jest.advanceTimersByTime(5000);
+      await jest.advanceTimersByTimeAsync(5000);
       expect(baseApiClient.getDeviceStates).toHaveBeenCalledTimes(2);
     });
 
@@ -228,7 +230,7 @@ describe('State Synchronization Integration Tests', () => {
   describe('Connection Resilience', () => {
     it('should use cached states when connection is unavailable', async () => {
       // Pre-populate cache
-      stateCache.setDeviceState('light-1', { on: true, brightness: 75 });
+      stateCache.setDeviceState('light-1', { online: true, on: true, brightness: 75 });
 
       // Mock connection as unavailable
       jest.spyOn(connectionManager, 'shouldAttemptOperation').mockReturnValue(false);
@@ -265,7 +267,7 @@ describe('State Synchronization Integration Tests', () => {
     it('should implement exponential backoff for reconnection', async () => {
       jest.spyOn(baseApiClient, 'getDevices').mockResolvedValue({
         success: false,
-        error: { message: 'Connection failed' },
+        error: { code: 'CONNECTION_ERROR', message: 'Connection failed' },
       });
 
       // First failure
@@ -284,7 +286,7 @@ describe('State Synchronization Integration Tests', () => {
   describe('State Caching', () => {
     it('should cache device states and mark stale entries', () => {
       // Add fresh state
-      stateCache.setDeviceState('light-1', { on: true, brightness: 50 });
+      stateCache.setDeviceState('light-1', { online: true, on: true, brightness: 50 });
 
       // Get state immediately (should be fresh)
       let cachedState = stateCache.getDeviceState('light-1');
@@ -304,10 +306,13 @@ describe('State Synchronization Integration Tests', () => {
 
     it('should clean up old cache entries', () => {
       // Add states
-      stateCache.setDeviceState('light-1', { on: true });
-      stateCache.setDeviceState('switch-1', { on: false });
+      stateCache.setDeviceState('light-1', { online: true, on: true });
+      stateCache.setDeviceState('switch-1', { online: true, on: false });
 
       expect(stateCache.getCacheStatistics().totalDevices).toBe(2);
+
+      // Advance the (fake) clock so entries have non-zero age
+      jest.advanceTimersByTime(60 * 1000);
 
       // Clean up entries older than 0 minutes (should remove all)
       const removedCount = stateCache.cleanupStaleEntries(0);
@@ -317,8 +322,8 @@ describe('State Synchronization Integration Tests', () => {
     });
 
     it('should provide cache statistics', () => {
-      stateCache.setDeviceState('light-1', { on: true });
-      stateCache.setDeviceState('switch-1', { on: false });
+      stateCache.setDeviceState('light-1', { online: true, on: true });
+      stateCache.setDeviceState('switch-1', { online: true, on: false });
 
       const stats = stateCache.getCacheStatistics();
 
@@ -334,7 +339,7 @@ describe('State Synchronization Integration Tests', () => {
       jest.spyOn(connectionManager, 'shouldAttemptOperation').mockReturnValue(false);
 
       // Pre-populate cache with stale data
-      stateCache.setDeviceState('light-1', { on: false, brightness: 30 });
+      stateCache.setDeviceState('light-1', { online: true, on: false, brightness: 30 });
 
       // Try to sync states (should use cache)
       await stateSyncManager.syncAllDeviceStates();
@@ -350,8 +355,8 @@ describe('State Synchronization Integration Tests', () => {
       jest.spyOn(baseApiClient, 'getDeviceStates').mockResolvedValue({
         success: true,
         data: {
-          'light-1': { on: true, brightness: 90 },
-          'switch-1': { on: false },
+          'light-1': { online: true, on: true, brightness: 90 },
+          'switch-1': { online: true, on: false },
         },
       });
 
@@ -359,8 +364,8 @@ describe('State Synchronization Integration Tests', () => {
       await stateSyncManager.syncAllDeviceStates();
 
       expect(baseApiClient.getDeviceStates).toHaveBeenCalled();
-      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('light-1', { on: true, brightness: 90 });
-      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('switch-1', { on: false });
+      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('light-1', { online: true, on: true, brightness: 90 });
+      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('switch-1', { online: true, on: false });
     });
 
     it('should maintain sync statistics', () => {
@@ -374,13 +379,13 @@ describe('State Synchronization Integration Tests', () => {
     it('should force refresh specific devices', async () => {
       jest.spyOn(baseApiClient, 'getDeviceState').mockResolvedValue({
         success: true,
-        data: { on: true, brightness: 100 },
+        data: { online: true, on: true, brightness: 100 },
       });
 
       await stateSyncManager.forceRefreshDevice('light-1');
 
       expect(baseApiClient.getDeviceState).toHaveBeenCalledWith('light-1');
-      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('light-1', { on: true, brightness: 100 });
+      expect(deviceManager.updateDeviceState).toHaveBeenCalledWith('light-1', { online: true, on: true, brightness: 100 });
     });
   });
 });

@@ -1,7 +1,19 @@
 import { AccessoryFactory } from '../AccessoryFactory';
 import { IGoogleHomeApiClient } from '../../interfaces';
 import { GoogleHomeDevice, DeviceType, DeviceTrait } from '../../types';
-import { Logger } from 'homebridge';
+import { Logger, API } from 'homebridge';
+
+// Mock API - Service constructor identifiers resolve to their names
+const mockApi = {
+  hap: {
+    Service: new Proxy({}, {
+      get: (_target, prop: string) => prop,
+    }),
+    Characteristic: new Proxy({}, {
+      get: (_target, prop: string) => prop,
+    }),
+  },
+} as unknown as API;
 
 // Mock API client
 const mockApiClient: IGoogleHomeApiClient = {
@@ -21,20 +33,49 @@ const mockLogger: Logger = {
   debug: jest.fn(),
 } as unknown as Logger;
 
-// Mock service and characteristic
-const mockCharacteristic = {
-  onGet: jest.fn().mockReturnThis(),
-  onSet: jest.fn().mockReturnThis(),
-  setProps: jest.fn().mockReturnThis(),
-};
+// One mock characteristic per name so tests can target callbacks precisely
+const characteristics = new Map<string, {
+  onGet: jest.Mock;
+  onSet: jest.Mock;
+  setProps: jest.Mock;
+}>();
+
+const getCharacteristic = jest.fn((name: string) => {
+  if (!characteristics.has(name)) {
+    characteristics.set(name, {
+      onGet: jest.fn().mockReturnThis(),
+      onSet: jest.fn().mockReturnThis(),
+      setProps: jest.fn().mockReturnThis(),
+    });
+  }
+  return characteristics.get(name);
+});
+
+const ch = (name: string) => characteristics.get(name)!;
 
 const mockService = {
-  getCharacteristic: jest.fn().mockReturnValue(mockCharacteristic),
+  getCharacteristic,
 };
+
+// One mock service per service name, with a UUID like real homebridge services
+const servicesByName = new Map<string, {
+  UUID: string;
+  getCharacteristic: jest.Mock;
+  updateCharacteristic: jest.Mock;
+}>();
 
 const mockAccessory = {
   getService: jest.fn(),
-  addService: jest.fn().mockReturnValue(mockService),
+  addService: jest.fn((name: string) => {
+    if (!servicesByName.has(name)) {
+      servicesByName.set(name, {
+        UUID: name,
+        getCharacteristic,
+        updateCharacteristic: jest.fn(),
+      });
+    }
+    return servicesByName.get(name);
+  }),
 };
 
 describe('AccessoryFactory', () => {
@@ -44,7 +85,7 @@ describe('AccessoryFactory', () => {
   let thermostatDevice: GoogleHomeDevice;
 
   beforeEach(() => {
-    accessoryFactory = new AccessoryFactory(mockApiClient, mockLogger);
+    accessoryFactory = new AccessoryFactory(mockApiClient, mockLogger, mockApi);
 
     lightDevice = {
       id: 'light-1',
@@ -85,10 +126,10 @@ describe('AccessoryFactory', () => {
       const services = accessoryFactory.createLightAccessory(lightDevice, mockAccessory as any);
 
       expect(services).toHaveLength(1);
-      expect(mockAccessory.addService).toHaveBeenCalledWith('Lightbulb', 'Living Room Light');
+      expect(mockAccessory.addService).toHaveBeenCalledWith('Lightbulb', 'Living Room Light', 'light-1');
       expect(mockService.getCharacteristic).toHaveBeenCalledWith('On');
-      expect(mockCharacteristic.onGet).toHaveBeenCalled();
-      expect(mockCharacteristic.onSet).toHaveBeenCalled();
+      expect(ch('On').onGet).toHaveBeenCalled();
+      expect(ch('On').onSet).toHaveBeenCalled();
     });
 
     it('should add brightness characteristic for dimmable lights', () => {
@@ -130,8 +171,8 @@ describe('AccessoryFactory', () => {
       expect(services).toHaveLength(1);
       expect(mockAccessory.addService).toHaveBeenCalledWith('Switch', 'Kitchen Switch');
       expect(mockService.getCharacteristic).toHaveBeenCalledWith('On');
-      expect(mockCharacteristic.onGet).toHaveBeenCalled();
-      expect(mockCharacteristic.onSet).toHaveBeenCalled();
+      expect(ch('On').onGet).toHaveBeenCalled();
+      expect(ch('On').onSet).toHaveBeenCalled();
     });
   });
 
@@ -230,7 +271,7 @@ describe('AccessoryFactory', () => {
       const services = accessoryFactory.createSensorAccessory(motionSensor, mockAccessory as any);
 
       expect(services).toHaveLength(1);
-      expect(mockAccessory.addService).toHaveBeenCalledWith('MotionSensor', 'Motion Sensor');
+      expect(mockAccessory.addService).toHaveBeenCalledWith('MotionSensor', 'Motion Sensor Motion');
     });
 
     it('should create contact sensor for door/window devices', () => {
@@ -244,7 +285,7 @@ describe('AccessoryFactory', () => {
       const services = accessoryFactory.createSensorAccessory(doorSensor, mockAccessory as any);
 
       expect(services).toHaveLength(1);
-      expect(mockAccessory.addService).toHaveBeenCalledWith('ContactSensor', 'Door Sensor');
+      expect(mockAccessory.addService).toHaveBeenCalledWith('ContactSensor', 'Door Sensor Contact');
     });
 
     it('should create temperature sensor for temperature devices', () => {
@@ -258,7 +299,7 @@ describe('AccessoryFactory', () => {
       const services = accessoryFactory.createSensorAccessory(tempSensor, mockAccessory as any);
 
       expect(services).toHaveLength(1);
-      expect(mockAccessory.addService).toHaveBeenCalledWith('TemperatureSensor', 'Temperature Sensor');
+      expect(mockAccessory.addService).toHaveBeenCalledWith('TemperatureSensor', 'Temperature Sensor Temperature');
     });
   });
 
@@ -339,7 +380,7 @@ describe('AccessoryFactory', () => {
     it('should set proper temperature range for target temperature', () => {
       accessoryFactory.createThermostatAccessory(thermostatDevice, mockAccessory as any);
 
-      expect(mockCharacteristic.setProps).toHaveBeenCalledWith({
+      expect(ch('TargetTemperature').setProps).toHaveBeenCalledWith({
         minValue: 10,
         maxValue: 35,
         minStep: 0.5,
@@ -367,9 +408,10 @@ describe('AccessoryFactory', () => {
     });
 
     it('should handle jammed lock state', async () => {
-      (mockApiClient.getDeviceState as jest.Mock)
-        .mockResolvedValueOnce({ success: true, data: false }) // isLocked
-        .mockResolvedValueOnce({ success: true, data: true }); // isJammed
+      (mockApiClient.getDeviceState as jest.Mock).mockResolvedValue({
+        success: true,
+        data: { isLocked: false, isJammed: true },
+      });
 
       const lockDevice = {
         ...switchDevice,
@@ -379,8 +421,7 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createLockAccessory(lockDevice, mockAccessory as any);
 
-      // Get the onGet callback for LockCurrentState
-      const onGetCallback = mockCharacteristic.onGet.mock.calls[0][0];
+      const onGetCallback = ch('LockCurrentState').onGet.mock.calls[0][0];
       const result = await onGetCallback();
 
       expect(result).toBe(3); // Jammed state
@@ -468,7 +509,7 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createSensorAccessory(tempSensor, mockAccessory as any);
 
-      expect(mockCharacteristic.setProps).toHaveBeenCalledWith({
+      expect(ch('CurrentTemperature').setProps).toHaveBeenCalledWith({
         minValue: -40,
         maxValue: 100,
         minStep: 0.1,
@@ -505,7 +546,7 @@ describe('AccessoryFactory', () => {
       accessoryFactory.createLightAccessory(tempLight, mockAccessory as any);
 
       expect(mockService.getCharacteristic).toHaveBeenCalledWith('ColorTemperature');
-      expect(mockCharacteristic.setProps).toHaveBeenCalledWith({
+      expect(ch('ColorTemperature').setProps).toHaveBeenCalledWith({
         minValue: Math.round(1000000 / 6500), // Convert to mired
         maxValue: Math.round(1000000 / 2000),
         minStep: 1,
@@ -515,7 +556,7 @@ describe('AccessoryFactory', () => {
     it('should set proper brightness range for dimmable lights', () => {
       accessoryFactory.createLightAccessory(lightDevice, mockAccessory as any);
 
-      expect(mockCharacteristic.setProps).toHaveBeenCalledWith({
+      expect(ch('Brightness').setProps).toHaveBeenCalledWith({
         minValue: 1,
         maxValue: 100,
         minStep: 1,
@@ -525,12 +566,12 @@ describe('AccessoryFactory', () => {
     it('should set proper hue and saturation ranges for color lights', () => {
       accessoryFactory.createLightAccessory(lightDevice, mockAccessory as any);
 
-      expect(mockCharacteristic.setProps).toHaveBeenCalledWith({
+      expect(ch('Hue').setProps).toHaveBeenCalledWith({
         minValue: 0,
         maxValue: 360,
         minStep: 1,
       });
-      expect(mockCharacteristic.setProps).toHaveBeenCalledWith({
+      expect(ch('Saturation').setProps).toHaveBeenCalledWith({
         minValue: 0,
         maxValue: 100,
         minStep: 1,
@@ -595,7 +636,7 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createThermostatAccessory(autoThermostat, mockAccessory as any);
 
-      expect(mockCharacteristic.setProps).toHaveBeenCalledWith({
+      expect(ch('HeatingThresholdTemperature').setProps).toHaveBeenCalledWith({
         minValue: 10,
         maxValue: 35,
         minStep: 0.5,
@@ -650,9 +691,10 @@ describe('AccessoryFactory', () => {
     });
 
     it('should handle door state using doorState property', async () => {
-      (mockApiClient.getDeviceState as jest.Mock)
-        .mockResolvedValueOnce({ success: true, data: false }) // doorOpen
-        .mockResolvedValueOnce({ success: true, data: 'open' }); // doorState
+      (mockApiClient.getDeviceState as jest.Mock).mockResolvedValue({
+        success: true,
+        data: { doorState: 'open' },
+      });
 
       const doorLockDevice = {
         ...switchDevice,
@@ -663,15 +705,10 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createLockAccessory(doorLockDevice, mockAccessory as any);
 
-      // Get the onGet callback for ContactSensorState
-      const onGetCallback = mockCharacteristic.onGet.mock.calls.find(
-        call => call.length > 0
-      )?.[0];
+      const onGetCallback = ch('ContactSensorState').onGet.mock.calls[0][0];
+      const result = await onGetCallback();
 
-      if (onGetCallback) {
-        const result = await onGetCallback();
-        expect(result).toBe(1); // Open state
-      }
+      expect(result).toBe(1); // Open state
     });
   });
 
@@ -757,8 +794,10 @@ describe('AccessoryFactory', () => {
     });
 
     it('should detect CO2 abnormal levels correctly', async () => {
-      (mockApiClient.getDeviceState as jest.Mock)
-        .mockResolvedValueOnce({ success: true, data: 1200 }); // High CO2 level
+      (mockApiClient.getDeviceState as jest.Mock).mockResolvedValue({
+        success: true,
+        data: { carbonDioxideLevel: 1200 },
+      });
 
       const co2Sensor = {
         ...switchDevice,
@@ -770,15 +809,10 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createSensorAccessory(co2Sensor, mockAccessory as any);
 
-      // Get the onGet callback for CarbonDioxideDetected
-      const onGetCallback = mockCharacteristic.onGet.mock.calls.find(
-        call => call.length > 0
-      )?.[0];
+      const onGetCallback = ch('CarbonDioxideDetected').onGet.mock.calls[0][0];
+      const result = await onGetCallback();
 
-      if (onGetCallback) {
-        const result = await onGetCallback();
-        expect(result).toBe(1); // Abnormal (> 1000 ppm)
-      }
+      expect(result).toBe(1); // Abnormal (> 1000 ppm)
     });
   });
 
@@ -837,7 +871,7 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createLightAccessory(speakerLight, mockAccessory as any);
 
-      expect(mockCharacteristic.setProps).toHaveBeenCalledWith({
+      expect(ch('Volume').setProps).toHaveBeenCalledWith({
         minValue: 0,
         maxValue: 100,
         minStep: 1,
@@ -845,8 +879,10 @@ describe('AccessoryFactory', () => {
     });
 
     it('should handle outlet in use detection based on power usage', async () => {
-      (mockApiClient.getDeviceState as jest.Mock)
-        .mockResolvedValueOnce({ success: true, data: 25 }); // Power usage in watts
+      (mockApiClient.getDeviceState as jest.Mock).mockResolvedValue({
+        success: true,
+        data: { on: false, currentPowerW: 25 },
+      });
 
       const plugLight = {
         ...lightDevice,
@@ -856,15 +892,10 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createLightAccessory(plugLight, mockAccessory as any);
 
-      // Get the onGet callback for OutletInUse
-      const onGetCallback = mockCharacteristic.onGet.mock.calls.find(
-        call => call.length > 0
-      )?.[0];
+      const onGetCallback = ch('OutletInUse').onGet.mock.calls[0][0];
+      const result = await onGetCallback();
 
-      if (onGetCallback) {
-        const result = await onGetCallback();
-        expect(result).toBe(true); // In use (power > 0)
-      }
+      expect(result).toBe(true); // In use (power > 0)
     });
   });
 
@@ -874,8 +905,10 @@ describe('AccessoryFactory', () => {
     });
 
     it('should detect charging state for rechargeable devices', async () => {
-      (mockApiClient.getDeviceState as jest.Mock)
-        .mockResolvedValueOnce({ success: true, data: true }); // isCharging
+      (mockApiClient.getDeviceState as jest.Mock).mockResolvedValue({
+        success: true,
+        data: { isCharging: true },
+      });
 
       const rechargeableDevice = {
         ...switchDevice,
@@ -886,20 +919,17 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createSensorAccessory(rechargeableDevice, mockAccessory as any);
 
-      // Get the onGet callback for ChargingState
-      const onGetCallback = mockCharacteristic.onGet.mock.calls.find(
-        call => call.length > 0
-      )?.[0];
+      const onGetCallback = ch('ChargingState').onGet.mock.calls[0][0];
+      const result = await onGetCallback();
 
-      if (onGetCallback) {
-        const result = await onGetCallback();
-        expect(result).toBe(1); // Charging
-      }
+      expect(result).toBe(1); // Charging
     });
 
     it('should default to not chargeable for devices without charging info', async () => {
-      (mockApiClient.getDeviceState as jest.Mock)
-        .mockResolvedValueOnce({ success: true, data: false }); // isCharging = false
+      (mockApiClient.getDeviceState as jest.Mock).mockResolvedValue({
+        success: true,
+        data: { isCharging: false },
+      });
 
       const nonRechargeableDevice = {
         ...switchDevice,
@@ -910,15 +940,10 @@ describe('AccessoryFactory', () => {
 
       accessoryFactory.createSensorAccessory(nonRechargeableDevice, mockAccessory as any);
 
-      // Get the onGet callback for ChargingState
-      const onGetCallback = mockCharacteristic.onGet.mock.calls.find(
-        call => call.length > 0
-      )?.[0];
+      const onGetCallback = ch('ChargingState').onGet.mock.calls[0][0];
+      const result = await onGetCallback();
 
-      if (onGetCallback) {
-        const result = await onGetCallback();
-        expect(result).toBe(0); // Not charging
-      }
+      expect(result).toBe(0); // Not charging
     });
   });
 
@@ -936,7 +961,7 @@ describe('AccessoryFactory', () => {
 
     it('should determine multiple sensor types correctly', () => {
       const factory = accessoryFactory as any;
-      
+
       const multiSensor = {
         name: 'Motion Temperature Humidity Sensor',
         state: {
@@ -977,19 +1002,14 @@ describe('AccessoryFactory', () => {
       });
 
       mockAccessory.getService.mockReturnValue(null);
-      
+
       // Create light accessory to set up characteristics
       accessoryFactory.createLightAccessory(lightDevice, mockAccessory as any);
 
-      // Get the onGet callback for the 'On' characteristic
-      const onGetCallback = mockCharacteristic.onGet.mock.calls.find(
-        call => call.length > 0
-      )?.[0];
+      const onGetCallback = ch('On').onGet.mock.calls[0][0];
+      const result = await onGetCallback();
 
-      if (onGetCallback) {
-        const result = await onGetCallback();
-        expect(result).toBe(true);
-      }
+      expect(result).toBe(true);
     });
 
     it('should handle device command execution', async () => {
@@ -998,55 +1018,45 @@ describe('AccessoryFactory', () => {
       });
 
       mockAccessory.getService.mockReturnValue(null);
-      
+
       // Create light accessory to set up characteristics
       accessoryFactory.createLightAccessory(lightDevice, mockAccessory as any);
 
-      // Get the onSet callback for the 'On' characteristic
-      const onSetCallback = mockCharacteristic.onSet.mock.calls.find(
-        call => call.length > 0
-      )?.[0];
+      const onSetCallback = ch('On').onSet.mock.calls[0][0];
+      await onSetCallback(true);
 
-      if (onSetCallback) {
-        await onSetCallback(true);
-        expect(mockApiClient.executeCommand).toHaveBeenCalledWith(
-          'light-1',
-          expect.objectContaining({
-            command: 'action.devices.commands.OnOff',
-            params: { on: true },
-          })
-        );
-      }
+      expect(mockApiClient.executeCommand).toHaveBeenCalledWith(
+        'light-1',
+        expect.objectContaining({
+          command: 'action.devices.commands.OnOff',
+          params: { on: true },
+        })
+      );
     });
 
     it('should handle nested state path retrieval', async () => {
       (mockApiClient.getDeviceState as jest.Mock).mockResolvedValueOnce({
         success: true,
-        data: { 
-          color: { 
-            spectrumHsv: { 
-              hue: 180, 
-              saturation: 0.8, 
-              value: 1 
-            } 
-          } 
+        data: {
+          color: {
+            spectrumHsv: {
+              hue: 180,
+              saturation: 0.8,
+              value: 1
+            }
+          }
         },
       });
 
       mockAccessory.getService.mockReturnValue(null);
-      
+
       // Create light accessory to set up characteristics
       accessoryFactory.createLightAccessory(lightDevice, mockAccessory as any);
 
-      // Get the onGet callback for the 'Hue' characteristic
-      const hueGetCallback = mockCharacteristic.onGet.mock.calls.find(
-        (_, index) => mockService.getCharacteristic.mock.calls[index]?.[0] === 'Hue'
-      )?.[0];
+      const hueGetCallback = ch('Hue').onGet.mock.calls[0][0];
+      const result = await hueGetCallback();
 
-      if (hueGetCallback) {
-        const result = await hueGetCallback();
-        expect(result).toBe(180);
-      }
+      expect(result).toBe(180);
     });
 
     it('should handle API errors gracefully', async () => {
@@ -1055,12 +1065,11 @@ describe('AccessoryFactory', () => {
       );
 
       mockAccessory.getService.mockReturnValue(null);
-      
+
       // Create light accessory to set up characteristics
       accessoryFactory.createLightAccessory(lightDevice, mockAccessory as any);
 
-      // Get the onGet callback for the 'On' characteristic
-      const onGetCallback = mockCharacteristic.onGet.mock.calls[0][0];
+      const onGetCallback = ch('On').onGet.mock.calls[0][0];
       const result = await onGetCallback();
 
       expect(result).toBe(false); // Should return default value

@@ -6,14 +6,55 @@ import { PluginConfig, GoogleHomeDevice, DeviceType, DeviceTrait } from '../../t
 import { Logger, API, PlatformConfig } from 'homebridge';
 
 // Mock Homebridge API
+const makeCharacteristic = () => ({
+  onGet: jest.fn().mockReturnThis(),
+  onSet: jest.fn().mockReturnThis(),
+  setProps: jest.fn().mockReturnThis(),
+  updateCharacteristic: jest.fn(),
+});
+
+class MockPlatformAccessory {
+  displayName: string;
+  UUID: string;
+  context: Record<string, unknown> = {};
+  services: Array<{ UUID: string | undefined; getCharacteristic: jest.Mock }> = [];
+
+  constructor(name: string, uuid: string, _category?: number) {
+    this.displayName = name;
+    this.UUID = uuid;
+  }
+
+  getService(): null {
+    return null;
+  }
+
+  addService(name: unknown): { UUID: string | undefined; getCharacteristic: jest.Mock } {
+    const service: { UUID: string | undefined; getCharacteristic: jest.Mock } = {
+      UUID: typeof name === 'string' ? name : undefined,
+      getCharacteristic: jest.fn(() => makeCharacteristic()),
+    };
+    this.services.push(service);
+    return service;
+  }
+
+  removeService(service: { UUID: string | undefined }): void {
+    this.services = this.services.filter(s => s !== service);
+  }
+}
+
 const mockApi: Partial<API> = {
   on: jest.fn(),
   registerPlatformAccessories: jest.fn(),
   unregisterPlatformAccessories: jest.fn(),
   updatePlatformAccessories: jest.fn(),
+  platformAccessory: MockPlatformAccessory as unknown as API['platformAccessory'],
   hap: {
-    Service: {} as any,
-    Characteristic: {} as any,
+    Service: new Proxy({}, {
+      get: (_target, prop: string) => prop,
+    }),
+    Characteristic: new Proxy({}, {
+      get: (_target, prop: string) => prop,
+    }),
   } as any,
 };
 
@@ -81,27 +122,20 @@ describe('Device Discovery Integration Tests', () => {
   let apiClient: GoogleHomeApiClient;
   let deviceManager: DeviceManager;
 
-  beforeEach(() => {
-    // Create real instances with mocked dependencies
-    authManager = new AuthManager(mockConfig, mockLogger);
-    apiClient = new GoogleHomeApiClient(authManager, mockLogger);
-    deviceManager = new DeviceManager(apiClient, mockConfig, mockLogger);
-
-    // Mock the authentication
-    jest.spyOn(authManager, 'isAuthenticated').mockReturnValue(true);
-    jest.spyOn(authManager, 'authenticate').mockResolvedValue({
+  const spyPlatformComponents = (target: GoogleHomePlatform) => {
+    jest.spyOn(target.authManager, 'isAuthenticated').mockReturnValue(true);
+    jest.spyOn(target.authManager, 'authenticate').mockResolvedValue({
       accessToken: 'test-access-token',
       refreshToken: 'test-refresh-token',
       expiresAt: Date.now() + 3600000,
     });
 
-    // Mock API responses
-    jest.spyOn(apiClient, 'getDevices').mockResolvedValue({
+    jest.spyOn(target.apiClient, 'getDevices').mockResolvedValue({
       success: true,
       data: mockDevices,
     });
 
-    jest.spyOn(apiClient, 'getDeviceStates').mockResolvedValue({
+    jest.spyOn(target.apiClient, 'getDeviceStates').mockResolvedValue({
       success: true,
       data: {
         'light-1': { online: true, on: false, brightness: 50 },
@@ -114,10 +148,23 @@ describe('Device Discovery Integration Tests', () => {
         },
       },
     });
+  };
 
+  beforeEach(() => {
+    // Create the platform with real components, then mock their API surface
     platform = new GoogleHomePlatform(mockLogger, mockConfig, mockApi as API);
+    authManager = platform.authManager;
+    apiClient = platform.apiClient;
+    deviceManager = platform.deviceManager;
+
+    spyPlatformComponents(platform);
 
     jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    platform.stateSyncManager.stopPolling();
+    platform.deviceManager.stopDeviceLifecycleMonitoring();
   });
 
   describe('End-to-End Device Discovery', () => {
@@ -192,7 +239,13 @@ describe('Device Discovery Integration Tests', () => {
         mockApi as API
       );
 
+      spyPlatformComponents(filteredPlatform);
+
       await filteredPlatform.discoverDevices();
+
+      // Stop background timers started by this extra platform instance
+      filteredPlatform.stateSyncManager.stopPolling();
+      filteredPlatform.deviceManager.stopDeviceLifecycleMonitoring();
 
       // Should only register 1 accessory (light, excluding kitchen switch)
       const registerCalls = (mockApi.registerPlatformAccessories as jest.Mock).mock.calls;
@@ -315,12 +368,12 @@ describe('Device Discovery Integration Tests', () => {
 
   describe('Configuration Validation', () => {
     it('should validate configuration on startup', () => {
-      // Create platform with invalid config
+      // Create platform with invalid config (missing required credentials)
       const invalidConfig = {
         platform: 'GoogleHomeToHomebridgeSync',
         name: '',
-        clientId: 'invalid',
-        clientSecret: 'invalid',
+        clientId: '',
+        clientSecret: '',
       } as PlatformConfig & PluginConfig;
 
       new GoogleHomePlatform(

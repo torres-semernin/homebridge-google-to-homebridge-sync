@@ -1,17 +1,13 @@
-import { API, Logger, PlatformConfig, PlatformAccessory } from 'homebridge';
+import { API, Logger, PlatformConfig } from 'homebridge';
 import { GoogleHomePlatform } from '../../platform';
-import { AuthManager } from '../../auth/AuthManager';
-import { GoogleHomeApiClient } from '../../api/GoogleHomeApiClient';
-import { DeviceManager } from '../../device/DeviceManager';
-import { AccessoryFactory } from '../../accessory/AccessoryFactory';
-import { StateSyncManager } from '../../sync/StateSyncManager';
 import { PLATFORM_NAME } from '../../constants';
-import { GoogleHomeDevice, DeviceType } from '../../types';
+import { GoogleHomeDevice, DeviceType, DeviceTrait } from '../../types';
 
 // Mock implementations for end-to-end testing
 class MockHomebridgeAPI {
   public hap = {
     Service: {
+      AccessoryInformation: 'AccessoryInformation',
       Lightbulb: 'Lightbulb',
       Switch: 'Switch',
       Outlet: 'Outlet',
@@ -41,24 +37,31 @@ class MockHomebridgeAPI {
     },
   };
 
+  public on = jest.fn();
+
   public platformAccessory = jest.fn().mockImplementation((displayName: string, uuid: string) => ({
     displayName,
     UUID: uuid,
     context: {},
     services: [],
-    addService: jest.fn().mockReturnValue({
+    addService: jest.fn().mockImplementation(() => ({
       setCharacteristic: jest.fn().mockReturnThis(),
       getCharacteristic: jest.fn().mockReturnValue({
         on: jest.fn().mockReturnThis(),
+        onGet: jest.fn().mockReturnThis(),
+        onSet: jest.fn().mockReturnThis(),
         updateValue: jest.fn().mockReturnThis(),
         setProps: jest.fn().mockReturnThis(),
       }),
-    }),
+    })),
     getService: jest.fn(),
     removeService: jest.fn(),
   }));
 
   public registerPlatform = jest.fn();
+  public registerPlatformAccessories = jest.fn();
+  public updatePlatformAccessories = jest.fn();
+  public unregisterPlatformAccessories = jest.fn();
 }
 
 class MockLogger {
@@ -71,7 +74,7 @@ class MockLogger {
 describe('End-to-End Integration Tests', () => {
   let mockAPI: MockHomebridgeAPI;
   let mockLogger: MockLogger;
-  let platform: GoogleHomePlatform;
+  let platform: GoogleHomePlatform | undefined;
   let mockConfig: PlatformConfig;
 
   const mockDevices: GoogleHomeDevice[] = [
@@ -79,7 +82,7 @@ describe('End-to-End Integration Tests', () => {
       id: 'light-living-room',
       name: 'Living Room Light',
       type: DeviceType.LIGHT,
-      traits: ['action.devices.traits.OnOff', 'action.devices.traits.Brightness'],
+      traits: [DeviceTrait.ON_OFF, DeviceTrait.BRIGHTNESS],
       attributes: {},
       state: { on: true, brightness: 75 },
       roomHint: 'Living Room',
@@ -92,7 +95,7 @@ describe('End-to-End Integration Tests', () => {
       id: 'switch-kitchen',
       name: 'Kitchen Switch',
       type: DeviceType.SWITCH,
-      traits: ['action.devices.traits.OnOff'],
+      traits: [DeviceTrait.ON_OFF],
       attributes: {},
       state: { on: false },
       roomHint: 'Kitchen',
@@ -103,12 +106,41 @@ describe('End-to-End Integration Tests', () => {
     },
   ];
 
+  const setupPlatform = (config: PlatformConfig = mockConfig): GoogleHomePlatform => {
+    const p = new GoogleHomePlatform(
+      mockLogger as unknown as Logger,
+      config,
+      mockAPI as unknown as API
+    );
+    platform = p;
+
+    jest.spyOn(p.authManager, 'isAuthenticated').mockReturnValue(true);
+    jest.spyOn(p.authManager, 'authenticate').mockResolvedValue({
+      accessToken: 'test-access-token',
+      refreshToken: 'test-refresh-token',
+      expiresAt: Date.now() + 3600000,
+    });
+    jest.spyOn(p.apiClient, 'getDevices').mockResolvedValue({
+      success: true,
+      data: mockDevices,
+    });
+    // Keep background polling hermetic
+    jest.spyOn(p.apiClient, 'getDeviceStates').mockResolvedValue({
+      success: true,
+      data: {},
+    });
+    jest.spyOn(p.apiClient, 'executeCommand').mockResolvedValue({ success: true });
+
+    return p;
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
-    
+    platform = undefined;
+
     mockAPI = new MockHomebridgeAPI();
     mockLogger = new MockLogger();
-    
+
     mockConfig = {
       platform: PLATFORM_NAME,
       name: 'Google Home Sync E2E Test',
@@ -119,95 +151,68 @@ describe('End-to-End Integration Tests', () => {
     };
   });
 
+  afterEach(() => {
+    platform?.stateSyncManager.stopPolling();
+    platform?.deviceManager.stopDeviceLifecycleMonitoring();
+  });
+
   describe('Complete Plugin Lifecycle', () => {
     it('should complete full device discovery and setup workflow', async () => {
       // Step 1: Initialize platform
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        mockConfig,
-        mockAPI as unknown as API
-      );
+      const p = setupPlatform();
 
-      expect(platform).toBeDefined();
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Initializing Google Home Sync platform')
-      );
+      expect(p).toBeDefined();
+      expect(mockLogger.debug).toHaveBeenCalledWith('Initializing Google Home Platform Plugin');
 
-      // Step 2: Mock successful authentication
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.authManager, 'getAccessToken').mockResolvedValue('mock-token');
-
-      // Step 3: Mock API client responses
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-      jest.spyOn(platform.apiClient, 'getDeviceState').mockImplementation(async (deviceId) => {
-        const device = mockDevices.find(d => d.id === deviceId);
-        return device?.state || {};
-      });
-      jest.spyOn(platform.apiClient, 'executeCommand').mockResolvedValue({ success: true });
+      // Step 2/3: Mocks are in place from setupPlatform
 
       // Step 4: Discover devices
-      await platform.discoverDevices();
+      await p.discoverDevices();
 
       // Verify authentication was called
-      expect(platform.authManager.authenticate).toHaveBeenCalled();
-      
+      expect(p.authManager.authenticate).toHaveBeenCalled();
+
       // Verify devices were retrieved
-      expect(platform.apiClient.getDevices).toHaveBeenCalled();
-      
+      expect(p.apiClient.getDevices).toHaveBeenCalled();
+
       // Verify accessories were created
       expect(mockAPI.platformAccessory).toHaveBeenCalledTimes(mockDevices.length);
 
-      // Step 5: Start state synchronization
-      jest.spyOn(platform.stateSyncManager, 'startPolling').mockImplementation(() => {});
-      platform.stateSyncManager.startPolling();
-      
-      expect(platform.stateSyncManager.startPolling).toHaveBeenCalled();
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Started state synchronization')
-      );
+      // Step 5: State synchronization is started as part of discovery
+      expect(mockLogger.info).toHaveBeenCalledWith('Starting state synchronization...');
+      expect(p.stateSyncManager.getSyncStatistics().isPolling).toBe(true);
     });
 
     it('should handle device state changes end-to-end', async () => {
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        mockConfig,
-        mockAPI as unknown as API
-      );
-
-      // Setup mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-      jest.spyOn(platform.apiClient, 'executeCommand').mockResolvedValue({ success: true });
+      const p = setupPlatform();
 
       // Discover devices
-      await platform.discoverDevices();
+      await p.discoverDevices();
 
       // Simulate HomeKit command (user turns on light)
       const deviceId = 'light-living-room';
-      const command = { on: true, brightness: 100 };
+      const params = { on: true, brightness: 100 };
 
       // Mock the state sync manager's sendCommand method
-      jest.spyOn(platform.stateSyncManager, 'sendCommand').mockImplementation(async (id, cmd) => {
+      jest.spyOn(p.stateSyncManager, 'sendCommand').mockImplementation(async (id, command, cmdParams) => {
         // Simulate sending command to Google Home
-        await platform.apiClient.executeCommand(id, cmd);
-        
+        await p.apiClient.executeCommand(id, { command, params: cmdParams });
+
         // Simulate state update
         const device = mockDevices.find(d => d.id === id);
         if (device) {
-          Object.assign(device.state, cmd);
+          Object.assign(device.state, cmdParams);
         }
-        
-        return { success: true };
       });
 
       // Execute command
-      const result = await platform.stateSyncManager.sendCommand(deviceId, command);
+      await p.stateSyncManager.sendCommand(deviceId, 'action.devices.commands.OnOff', params);
 
-      expect(result.success).toBe(true);
-      expect(platform.apiClient.executeCommand).toHaveBeenCalledWith(deviceId, command);
-      
+      expect(p.apiClient.executeCommand).toHaveBeenCalledWith(deviceId, {
+        command: 'action.devices.commands.OnOff',
+        params,
+      });
+
       // Verify device state was updated
       const updatedDevice = mockDevices.find(d => d.id === deviceId);
       expect(updatedDevice?.state.on).toBe(true);
@@ -215,19 +220,10 @@ describe('End-to-End Integration Tests', () => {
     });
 
     it('should handle device addition and removal dynamically', async () => {
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        mockConfig,
-        mockAPI as unknown as API
-      );
-
-      // Setup initial mocks
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
+      const p = setupPlatform();
 
       // Initial discovery
-      await platform.discoverDevices();
+      await p.discoverDevices();
       expect(mockAPI.platformAccessory).toHaveBeenCalledTimes(2);
 
       // Simulate new device added to Google Home
@@ -235,7 +231,7 @@ describe('End-to-End Integration Tests', () => {
         id: 'thermostat-bedroom',
         name: 'Bedroom Thermostat',
         type: DeviceType.THERMOSTAT,
-        traits: ['action.devices.traits.TemperatureSetting'],
+        traits: [DeviceTrait.TEMPERATURE_SETTING],
         attributes: {
           availableThermostatModes: ['off', 'heat', 'cool'],
           thermostatTemperatureRange: { minThresholdCelsius: 10, maxThresholdCelsius: 32 },
@@ -253,97 +249,82 @@ describe('End-to-End Integration Tests', () => {
       };
 
       const updatedDevices = [...mockDevices, newDevice];
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(updatedDevices);
+      jest.spyOn(p.apiClient, 'getDevices').mockResolvedValue({
+        success: true,
+        data: updatedDevices,
+      });
 
-      // Mock device manager methods
-      jest.spyOn(platform.deviceManager, 'discoverDevices').mockResolvedValue(updatedDevices);
-      jest.spyOn(platform.deviceManager, 'createAccessory').mockImplementation(() => {});
+      // Mock device manager device list refresh
+      jest.spyOn(p.deviceManager, 'discoverDevices').mockResolvedValue(updatedDevices);
 
       // Trigger device refresh
-      await platform.discoverDevices();
+      await p.discoverDevices();
 
-      expect(platform.deviceManager.discoverDevices).toHaveBeenCalled();
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Discovered 3 devices')
-      );
+      expect(p.deviceManager.discoverDevices).toHaveBeenCalled();
+      expect(mockLogger.info).toHaveBeenCalledWith('Discovered 3 devices');
+      expect(mockAPI.platformAccessory).toHaveBeenCalledTimes(3);
     });
   });
 
   describe('Error Recovery and Resilience', () => {
     it('should recover from authentication failures', async () => {
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        mockConfig,
-        mockAPI as unknown as API
-      );
+      const p = setupPlatform();
 
       // Simulate initial auth failure, then success
       let authAttempts = 0;
-      jest.spyOn(platform.authManager, 'authenticate').mockImplementation(async () => {
+      jest.spyOn(p.authManager, 'authenticate').mockImplementation(async () => {
         authAttempts++;
         if (authAttempts === 1) {
           throw new Error('Authentication failed');
         }
-        return true;
+        return {
+          accessToken: 'test-access-token',
+          refreshToken: 'test-refresh-token',
+          expiresAt: Date.now() + 3600000,
+        };
       });
 
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(false);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-
-      // First attempt should fail
-      await expect(platform.discoverDevices()).rejects.toThrow('Authentication failed');
+      // First attempt fails (error is absorbed and logged by the platform)
+      await p.discoverDevices();
       expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.stringContaining('Authentication failed')
+        'Failed to discover devices:',
+        expect.any(Error)
       );
 
       // Second attempt should succeed
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      await platform.discoverDevices();
+      await p.discoverDevices();
 
-      expect(platform.authManager.authenticate).toHaveBeenCalledTimes(2);
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Successfully authenticated')
-      );
+      expect(p.authManager.authenticate).toHaveBeenCalledTimes(2);
+      expect(mockLogger.info).toHaveBeenCalledWith('Authentication successful');
+      expect(mockAPI.platformAccessory).toHaveBeenCalledTimes(mockDevices.length);
     });
 
     it('should handle network interruptions gracefully', async () => {
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        mockConfig,
-        mockAPI as unknown as API
-      );
+      const p = setupPlatform();
 
-      // Setup successful initial state
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-
-      await platform.discoverDevices();
+      await p.discoverDevices();
 
       // Simulate network failure during command execution
-      jest.spyOn(platform.apiClient, 'executeCommand').mockRejectedValueOnce(
+      jest.spyOn(p.apiClient, 'executeCommand').mockRejectedValueOnce(
         new Error('Network error')
       );
 
       // Mock retry logic
-      jest.spyOn(platform.stateSyncManager, 'sendCommand').mockImplementation(async (deviceId, command) => {
+      jest.spyOn(p.stateSyncManager, 'sendCommand').mockImplementation(async (deviceId, command, params) => {
         try {
-          await platform.apiClient.executeCommand(deviceId, command);
-          return { success: true };
-        } catch (error) {
+          await p.apiClient.executeCommand(deviceId, { command, params });
+        } catch {
           // Simulate retry after network recovery
           await new Promise(resolve => setTimeout(resolve, 100));
-          jest.spyOn(platform.apiClient, 'executeCommand').mockResolvedValueOnce({ success: true });
-          await platform.apiClient.executeCommand(deviceId, command);
-          return { success: true };
+          jest.spyOn(p.apiClient, 'executeCommand').mockResolvedValueOnce({ success: true });
+          await p.apiClient.executeCommand(deviceId, { command, params });
         }
       });
 
-      const result = await platform.stateSyncManager.sendCommand('light-living-room', { on: true });
-      expect(result.success).toBe(true);
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Network error') || expect.stringContaining('retry')
-      );
+      await p.stateSyncManager.sendCommand('light-living-room', 'action.devices.commands.OnOff', { on: true });
+
+      // Initial attempt + retry after recovery
+      expect(p.apiClient.executeCommand).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -354,7 +335,7 @@ describe('End-to-End Integration Tests', () => {
         id: `device-${i}`,
         name: `Device ${i}`,
         type: i % 2 === 0 ? DeviceType.LIGHT : DeviceType.SWITCH,
-        traits: ['action.devices.traits.OnOff'],
+        traits: [DeviceTrait.ON_OFF],
         attributes: {},
         state: { on: i % 2 === 0 },
         roomHint: `Room ${Math.floor(i / 10)}`,
@@ -364,59 +345,43 @@ describe('End-to-End Integration Tests', () => {
         },
       }));
 
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        mockConfig,
-        mockAPI as unknown as API
-      );
-
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(manyDevices);
+      const p = setupPlatform();
+      jest.spyOn(p.apiClient, 'getDevices').mockResolvedValue({
+        success: true,
+        data: manyDevices,
+      });
 
       const startTime = Date.now();
-      await platform.discoverDevices();
+      await p.discoverDevices();
       const endTime = Date.now();
 
       // Should complete within reasonable time (5 seconds)
       expect(endTime - startTime).toBeLessThan(5000);
       expect(mockAPI.platformAccessory).toHaveBeenCalledTimes(50);
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Discovered 50 devices')
-      );
+      expect(mockLogger.info).toHaveBeenCalledWith('Discovered 50 devices');
     });
 
     it('should handle concurrent state updates efficiently', async () => {
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        mockConfig,
-        mockAPI as unknown as API
-      );
+      const p = setupPlatform();
 
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-      jest.spyOn(platform.apiClient, 'executeCommand').mockResolvedValue({ success: true });
-
-      await platform.discoverDevices();
+      await p.discoverDevices();
 
       // Mock concurrent command execution
-      jest.spyOn(platform.stateSyncManager, 'sendCommand').mockImplementation(async (deviceId, command) => {
+      jest.spyOn(p.stateSyncManager, 'sendCommand').mockImplementation(async () => {
         await new Promise(resolve => setTimeout(resolve, Math.random() * 100));
-        return { success: true };
       });
 
       // Execute multiple commands concurrently
-      const commands = mockDevices.map((device, i) => 
-        platform.stateSyncManager.sendCommand(device.id, { on: i % 2 === 0 })
+      const commands = mockDevices.map((device, i) =>
+        p.stateSyncManager.sendCommand(device.id, 'action.devices.commands.OnOff', { on: i % 2 === 0 })
       );
 
       const startTime = Date.now();
-      const results = await Promise.all(commands);
+      await Promise.all(commands);
       const endTime = Date.now();
 
-      expect(results.every(r => r.success)).toBe(true);
       expect(endTime - startTime).toBeLessThan(1000); // Should complete quickly due to concurrency
+      expect(p.stateSyncManager.sendCommand).toHaveBeenCalledTimes(mockDevices.length);
     });
   });
 
@@ -430,29 +395,21 @@ describe('End-to-End Integration Tests', () => {
         },
       };
 
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        configWithFilter,
-        mockAPI as unknown as API
-      );
-
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
+      const p = setupPlatform(configWithFilter);
 
       // Mock device manager to apply filtering
-      jest.spyOn(platform.deviceManager, 'discoverDevices').mockImplementation(async () => {
-        return mockDevices.filter(device => 
+      jest.spyOn(p.deviceManager, 'discoverDevices').mockImplementation(async () => {
+        return mockDevices.filter(device =>
           device.type === DeviceType.LIGHT && device.roomHint !== 'Kitchen'
         );
       });
 
-      await platform.discoverDevices();
+      await p.discoverDevices();
 
-      expect(platform.deviceManager.discoverDevices).toHaveBeenCalled();
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Applied device filtering')
-      );
+      expect(p.deviceManager.discoverDevices).toHaveBeenCalled();
+      expect(mockLogger.info).toHaveBeenCalledWith('Discovered 1 devices');
+      // Only the living room light passes the filter
+      expect(mockAPI.platformAccessory).toHaveBeenCalledTimes(1);
     });
 
     it('should apply custom device naming configuration', async () => {
@@ -464,21 +421,13 @@ describe('End-to-End Integration Tests', () => {
         },
       };
 
-      platform = new GoogleHomePlatform(
-        mockLogger as unknown as Logger,
-        configWithCustomNames,
-        mockAPI as unknown as API
-      );
+      const p = setupPlatform(configWithCustomNames);
 
-      jest.spyOn(platform.authManager, 'authenticate').mockResolvedValue(true);
-      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValue(mockDevices);
-
-      await platform.discoverDevices();
+      await p.discoverDevices();
 
       // Verify custom names were applied
-      expect(mockAPI.platformAccessory).toHaveBeenCalledWith('Main Light', expect.any(String));
-      expect(mockAPI.platformAccessory).toHaveBeenCalledWith('Kitchen Power', expect.any(String));
+      expect(mockAPI.platformAccessory).toHaveBeenCalledWith('Main Light', expect.any(String), expect.any(Number));
+      expect(mockAPI.platformAccessory).toHaveBeenCalledWith('Kitchen Power', expect.any(String), expect.any(Number));
     });
   });
 });

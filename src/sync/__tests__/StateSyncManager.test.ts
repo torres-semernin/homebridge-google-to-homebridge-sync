@@ -16,11 +16,17 @@ const mockApiClient: IGoogleHomeApiClient = {
 // Mock device manager
 const mockDeviceManager: IDeviceManager = {
   discoverDevices: jest.fn(),
-  createAccessory: jest.fn(),
+  getAccessoryConfig: jest.fn(),
+  configureAccessory: jest.fn(),
   updateDeviceState: jest.fn(),
   removeDevice: jest.fn(),
   getManagedDevices: jest.fn(),
   isDeviceSupported: jest.fn(),
+  startDeviceLifecycleMonitoring: jest.fn(),
+  stopDeviceLifecycleMonitoring: jest.fn(),
+  setDeviceChangeCallback: jest.fn(),
+  checkForDeviceChanges: jest.fn(),
+  forceDeviceRefresh: jest.fn(),
 };
 
 // Mock logger
@@ -127,7 +133,7 @@ describe('StateSyncManager', () => {
     it('should handle state change event', async () => {
       const stateEvent: StateUpdateEvent = {
         deviceId: 'light-1',
-        state: { on: true, brightness: 90 },
+        state: { online: true, on: true, brightness: 90 },
         timestamp: Date.now(),
       };
 
@@ -135,11 +141,11 @@ describe('StateSyncManager', () => {
 
       expect(mockDeviceManager.updateDeviceState).toHaveBeenCalledWith(
         'light-1',
-        { on: true, brightness: 90 }
+        { online: true, on: true, brightness: 90 }
       );
       expect(mockLogger.debug).toHaveBeenCalledWith(
         'Handling state change for device light-1:',
-        { on: true, brightness: 90 }
+        { online: true, on: true, brightness: 90 }
       );
     });
 
@@ -150,7 +156,7 @@ describe('StateSyncManager', () => {
 
       const stateEvent: StateUpdateEvent = {
         deviceId: 'light-1',
-        state: { on: true },
+        state: { online: true, on: true },
         timestamp: Date.now(),
       };
 
@@ -259,7 +265,10 @@ describe('StateSyncManager', () => {
         data: {},
       });
 
-      await stateSyncManager.syncAllDeviceStates();
+      const syncPromise = stateSyncManager.syncAllDeviceStates();
+      // Run all fake timers so chained inter-batch sleeps (1s each) resolve
+      await jest.runAllTimersAsync();
+      await syncPromise;
 
       // Should be called 3 times (25 devices / 10 per batch = 3 batches)
       expect(mockApiClient.getDeviceStates).toHaveBeenCalledTimes(3);
@@ -326,15 +335,14 @@ describe('StateSyncManager', () => {
 
       stateSyncManager.startPolling();
 
-      // First poll - should update all states
-      await jest.runOnlyPendingTimersAsync();
+      // First poll (triggered immediately by startPolling, not by a timer)
+      await jest.advanceTimersByTimeAsync(0);
       expect(mockDeviceManager.updateDeviceState).toHaveBeenCalledTimes(2);
 
       jest.clearAllMocks();
 
       // Second poll - should only update changed state
-      jest.advanceTimersByTime(30000);
-      await jest.runOnlyPendingTimersAsync();
+      await jest.advanceTimersByTimeAsync(30000);
       
       expect(mockDeviceManager.updateDeviceState).toHaveBeenCalledTimes(1);
       expect(mockDeviceManager.updateDeviceState).toHaveBeenCalledWith(

@@ -307,10 +307,11 @@ export class AccessoryFactory implements IAccessoryFactory {
       services.push(humidityService);
     }
 
-    // Add advanced thermostat features
-    this.createAdvancedThermostatFeatures(device, accessory, services);
-
     services.push(thermostatService);
+
+    // Add advanced thermostat features
+    this.createAdvancedThermostatFeatures(device, accessory, services, thermostatService);
+
     return services;
   }
 
@@ -352,11 +353,12 @@ export class AccessoryFactory implements IAccessoryFactory {
         });
     }
 
+    services.push(lockService);
+
     // Add battery service and advanced lock features
     this.addBatteryService(device, accessory, services);
-    this.createAdvancedLockFeatures(device, accessory, services);
+    this.createAdvancedLockFeatures(device, accessory, services, lockService);
 
-    services.push(lockService);
     return services;
   }
 
@@ -405,8 +407,8 @@ export class AccessoryFactory implements IAccessoryFactory {
         }
           
         // Add battery service if motion sensor reports battery
-        this.addBatteryService(device, accessory, services);
-          
+        // (handled after the sensor type loop for all sensor types)
+
         services.push(motionService);
         break;
 
@@ -561,6 +563,9 @@ export class AccessoryFactory implements IAccessoryFactory {
       
       services.push(occupancyService);
     }
+
+    // Add battery service if the sensor reports battery level
+    this.addBatteryService(device, accessory, services);
 
     // Add advanced sensor features
     this.createAdvancedSensorFeatures(device, accessory, services);
@@ -788,14 +793,8 @@ export class AccessoryFactory implements IAccessoryFactory {
 
   private addBatteryService(device: GoogleHomeDevice, accessory: PlatformAccessory, services: Service[]): void {
     if (device.state && 'batteryLevel' in device.state) {
-      // Check if battery service already exists to avoid duplicates
-      const existingBattery = services.find(service => service.UUID === this.api.hap.Service.Battery.UUID);
-      if (existingBattery) {
-        return;
-      }
-      
-      const batteryService = accessory.getService(this.api.hap.Service.Battery) || 
-                            accessory.addService(this.api.hap.Service.Battery, `${device.name} Battery`);
+      const batteryService = accessory.getService(this.api.hap.Service.Battery) ||
+                             accessory.addService(this.api.hap.Service.Battery, `${device.name} Battery`);
       
       const batteryLevelCharacteristic = batteryService.getCharacteristic('BatteryLevel');
       if (batteryLevelCharacteristic) {
@@ -828,7 +827,7 @@ export class AccessoryFactory implements IAccessoryFactory {
     }
   }
 
-  private createAdvancedThermostatFeatures(device: GoogleHomeDevice, accessory: PlatformAccessory, services: Service[]): void {
+  private createAdvancedThermostatFeatures(device: GoogleHomeDevice, accessory: PlatformAccessory, services: Service[], thermostatService: Service): void {
     // Add scheduling support via programmable switches for different modes
     const availableModes = device.attributes?.availableThermostatModes as string[] || [];
     
@@ -878,8 +877,6 @@ export class AccessoryFactory implements IAccessoryFactory {
 
     // Add temperature range support for heat-cool mode
     if (availableModes.includes('heatcool') || availableModes.includes('auto')) {
-      const thermostatService = services.find(service => service.UUID === this.Service.Thermostat.UUID);
-      
       if (thermostatService && device.traits.includes(DeviceTrait.TEMPERATURE_SETTING)) {
         // Add heating threshold temperature
         const heatingThresholdService = thermostatService.getCharacteristic('HeatingThresholdTemperature');
@@ -922,10 +919,8 @@ export class AccessoryFactory implements IAccessoryFactory {
     }
   }
 
-  private createAdvancedLockFeatures(device: GoogleHomeDevice, accessory: PlatformAccessory, services: Service[]): void {
+  private createAdvancedLockFeatures(device: GoogleHomeDevice, accessory: PlatformAccessory, services: Service[], lockService: Service): void {
     // Add lock management features
-    const lockService = services.find(service => service.UUID === this.Service.LockManagement.UUID);
-    
     if (lockService) {
       // Add lock physical controls characteristic if supported
       if (device.attributes && 'lockPhysicalControls' in device.attributes) {
@@ -976,12 +971,16 @@ export class AccessoryFactory implements IAccessoryFactory {
       if (doorSensorState) {
         doorSensorState.onGet(async (): Promise<CharacteristicValue> => {
           const doorOpen = await this.getDeviceState(device.id, 'doorOpen', false);
-          const doorState = await this.getDeviceState(device.id, 'doorState', 'closed');
-          
-          if (typeof doorOpen === 'boolean') {
-            return doorOpen ? 1 : 0; // 1 = Open, 0 = Closed
+          const doorState = await this.getDeviceState(device.id, 'doorState', '');
+
+          // doorState is authoritative when present; fall back to doorOpen
+          if (doorState === 'open') {
+            return 1; // 1 = Open
           }
-          return (doorState as string) === 'open' ? 1 : 0;
+          if (doorState === 'closed') {
+            return 0; // 0 = Closed
+          }
+          return (doorOpen as boolean) ? 1 : 0;
         });
       }
       

@@ -92,7 +92,7 @@ This document summarizes the successful completion of Task 15 and validates that
 ## 📦 Package Configuration
 
 ### Homebridge Integration
-- ✅ **Plugin Name**: `homebridge-google-to-homebridge-sync`
+- ✅ **Plugin Name**: `homebridge-google-home-sync`
 - ✅ **Platform Name**: `GoogleHomeToHomebridgeSync`
 - ✅ **Config Schema**: Complete JSON schema for Config UI X
 - ✅ **Entry Point**: Proper platform registration

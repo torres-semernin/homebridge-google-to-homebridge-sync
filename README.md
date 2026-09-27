@@ -1,6 +1,6 @@
 # Google Home to Homebridge Sync
 
-[![npm version](https://badge.fury.io/js/homebridge-google-to-homebridge-sync.svg)](https://badge.fury.io/js/homebridge-google-to-homebridge-sync)
+[![npm version](https://badge.fury.io/js/homebridge-google-home-sync.svg)](https://badge.fury.io/js/homebridge-google-home-sync)
 [![Build Status](https://github.com/amitrathiesh/homebridge-google-to-homebridge-sync/workflows/CI/badge.svg)](https://github.com/amitrathiesh/homebridge-google-to-homebridge-sync/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -35,13 +35,13 @@ A Homebridge plugin that automatically imports and synchronizes all devices conn
 
 1. Open Homebridge Config UI X in your web browser
 2. Navigate to the "Plugins" tab
-3. Search for "homebridge-google-to-homebridge-sync"
+3. Search for "homebridge-google-home-sync"
 4. Click "Install"
 
 ### Option 2: Install via npm
 
 ```bash
-npm install -g homebridge-google-to-homebridge-sync
+npm install -g homebridge-google-home-sync
 ```
 
 ## Google Cloud Setup

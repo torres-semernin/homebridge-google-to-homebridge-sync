@@ -1,6 +1,6 @@
 {
   "displayName": "Google Home to Homebridge Sync",
-  "name": "homebridge-google-to-homebridge-sync",
+  "name": "homebridge-google-home-sync",
   "version": "1.0.0",
   "description": "Homebridge plugin to automatically import and sync all Google Home devices to HomeKit, supporting lights, switches, cameras, sensors, and more from any manufacturer",
   "main": "dist/index.js",
@@ -22,6 +22,7 @@
     "homebridge-plugin",
     "google-home",
     "google-assistant",
+    "homegraph",
     "homekit",
     "smart-home",
     "automation",

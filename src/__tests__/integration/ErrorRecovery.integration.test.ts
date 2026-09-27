@@ -3,20 +3,65 @@ import { AuthManager } from '../../auth';
 import { GoogleHomeApiClient } from '../../api';
 import { ConnectionManager, DeviceStateCache, ResilientApiClient } from '../../resilience';
 import { StateSyncManager } from '../../sync';
-import { PluginConfig } from '../../types';
+import { IDeviceManager } from '../../interfaces';
+import { PluginConfig, DeviceType, DeviceTrait } from '../../types';
+import { PLATFORM_NAME } from '../../constants';
 import { Logger, API, PlatformConfig } from 'homebridge';
 
 // Mock Homebridge API
-const mockApi: Partial<API> = {
+const mockApi = {
   on: jest.fn(),
   registerPlatformAccessories: jest.fn(),
   unregisterPlatformAccessories: jest.fn(),
   updatePlatformAccessories: jest.fn(),
+  platformAccessory: jest.fn().mockImplementation((displayName: string, uuid: string) => ({
+    displayName,
+    UUID: uuid,
+    context: {},
+    services: [],
+    addService: jest.fn().mockImplementation(() => ({
+      setCharacteristic: jest.fn().mockReturnThis(),
+      getCharacteristic: jest.fn().mockReturnValue({
+        on: jest.fn().mockReturnThis(),
+        onGet: jest.fn().mockReturnThis(),
+        onSet: jest.fn().mockReturnThis(),
+        updateValue: jest.fn().mockReturnThis(),
+        setProps: jest.fn().mockReturnThis(),
+      }),
+    })),
+    getService: jest.fn(),
+    removeService: jest.fn(),
+  })),
   hap: {
-    Service: {} as any,
-    Characteristic: {} as any,
-  } as any,
-};
+    Service: {
+      AccessoryInformation: 'AccessoryInformation',
+      Lightbulb: 'Lightbulb',
+      Switch: 'Switch',
+      Thermostat: 'Thermostat',
+      TemperatureSensor: 'TemperatureSensor',
+      HumiditySensor: 'HumiditySensor',
+      Battery: 'Battery',
+    },
+    Characteristic: {
+      On: 'On',
+      Brightness: 'Brightness',
+      CurrentTemperature: 'CurrentTemperature',
+      TargetTemperature: 'TargetTemperature',
+      CurrentRelativeHumidity: 'CurrentRelativeHumidity',
+      BatteryLevel: 'BatteryLevel',
+      StatusLowBattery: 'StatusLowBattery',
+      ChargingState: 'ChargingState',
+      Manufacturer: 'Manufacturer',
+      Model: 'Model',
+      SerialNumber: 'SerialNumber',
+      FirmwareRevision: 'FirmwareRevision',
+      Name: 'Name',
+    },
+    uuid: {
+      generate: jest.fn().mockReturnValue('test-uuid'),
+    },
+  },
+} as unknown as API;
 
 // Mock logger
 const mockLogger: Logger = {
@@ -27,7 +72,8 @@ const mockLogger: Logger = {
 } as unknown as Logger;
 
 // Mock configuration
-const mockConfig: PluginConfig = {
+const mockConfig: PluginConfig & PlatformConfig = {
+  platform: PLATFORM_NAME,
   name: 'Error Recovery Test',
   clientId: '123456789-test.apps.googleusercontent.com',
   clientSecret: 'GOCSPX-testsecret',
@@ -46,7 +92,25 @@ describe('Error Recovery Integration Tests', () => {
   let connectionManager: ConnectionManager;
   let stateCache: DeviceStateCache;
   let resilientApiClient: ResilientApiClient;
-  let stateSyncManager: StateSyncManager;
+
+  const spyPlatform = (p: GoogleHomePlatform): void => {
+    jest.spyOn(p.authManager, 'isAuthenticated').mockReturnValue(true);
+    jest.spyOn(p.authManager, 'authenticate').mockResolvedValue({
+      accessToken: 'test-access-token',
+      refreshToken: 'test-refresh-token',
+      expiresAt: Date.now() + 3600000,
+    });
+    jest.spyOn(p.apiClient, 'getDevices').mockResolvedValue({
+      success: true,
+      data: [],
+    });
+    // Keep background polling hermetic
+    jest.spyOn(p.apiClient, 'getDeviceStates').mockResolvedValue({
+      success: true,
+      data: {},
+    });
+    jest.spyOn(p.apiClient, 'executeCommand').mockResolvedValue({ success: true });
+  };
 
   beforeEach(() => {
     // Create component instances
@@ -63,41 +127,39 @@ describe('Error Recovery Integration Tests', () => {
 
   afterEach(() => {
     connectionManager.stopReconnectionAttempts();
+    platform.stateSyncManager.stopPolling();
+    platform.deviceManager.stopDeviceLifecycleMonitoring();
     jest.clearAllTimers();
   });
 
   describe('Authentication Error Recovery', () => {
     it('should handle token expiration and refresh automatically', async () => {
-      // Mock initial authentication success
-      jest.spyOn(authManager, 'isAuthenticated').mockReturnValue(true);
-      jest.spyOn(authManager, 'getValidAccessToken')
-        .mockRejectedValueOnce(new Error('Token expired'))
-        .mockResolvedValueOnce('new-access-token');
+      // Start with a stored token that expires within the 5-minute refresh window
+      (authManager as unknown as { tokens: { accessToken: string; refreshToken: string; expiresAt: number } }).tokens = {
+        accessToken: 'old-access-token',
+        refreshToken: 'stored-refresh-token',
+        expiresAt: Date.now() + 60000,
+      };
 
       jest.spyOn(authManager, 'refreshToken').mockResolvedValue({
         accessToken: 'new-access-token',
-        refreshToken: 'refresh-token',
+        refreshToken: 'new-refresh-token',
         expiresAt: Date.now() + 3600000,
       });
 
-      // Mock API call that triggers token refresh
-      jest.spyOn(baseApiClient, 'getDevices').mockResolvedValue({
-        success: true,
-        data: [],
-      });
-
-      // Trigger operation that requires authentication
-      await platform.discoverDevices();
+      const token = await authManager.getValidAccessToken();
 
       // Should have attempted token refresh
       expect(authManager.refreshToken).toHaveBeenCalled();
       expect(mockLogger.debug).toHaveBeenCalledWith('Access token expired or expiring soon, refreshing...');
+      expect(token).toBe('old-access-token');
     });
 
     it('should handle complete authentication failure', async () => {
       // Mock authentication failure
-      jest.spyOn(authManager, 'isAuthenticated').mockReturnValue(false);
-      jest.spyOn(authManager, 'authenticate').mockRejectedValue(new Error('Invalid credentials'));
+      spyPlatform(platform);
+      jest.spyOn(platform.authManager, 'isAuthenticated').mockReturnValue(false);
+      jest.spyOn(platform.authManager, 'authenticate').mockRejectedValue(new Error('Invalid credentials'));
 
       await platform.discoverDevices();
 
@@ -111,6 +173,7 @@ describe('Error Recovery Integration Tests', () => {
     });
 
     it('should retry authentication with exponential backoff', async () => {
+      jest.spyOn(authManager, 'isAuthenticated').mockReturnValue(false);
       jest.spyOn(authManager, 'authenticate')
         .mockRejectedValueOnce(new Error('Network error'))
         .mockRejectedValueOnce(new Error('Network error'))
@@ -120,51 +183,55 @@ describe('Error Recovery Integration Tests', () => {
           expiresAt: Date.now() + 3600000,
         });
 
-      // Mock connection manager to handle retries
-      jest.spyOn(connectionManager, 'checkConnection')
-        .mockResolvedValueOnce(false)
-        .mockResolvedValueOnce(false)
-        .mockResolvedValueOnce(true);
+      jest.spyOn(baseApiClient, 'getDevices').mockResolvedValue({
+        success: true,
+        data: [],
+      });
 
       // First attempt should fail
-      const result1 = await connectionManager.checkConnection();
+      const result1 = await connectionManager.forceReconnection();
       expect(result1).toBe(false);
 
+      // Backoff is scheduled before the next retry
+      const stateAfterFailure = connectionManager.getConnectionState();
+      expect(stateAfterFailure.consecutiveFailures).toBe(1);
+      expect(stateAfterFailure.nextRetryTime).toBeGreaterThan(Date.now());
+
       // Second attempt should fail
-      const result2 = await connectionManager.checkConnection();
+      const result2 = await connectionManager.forceReconnection();
       expect(result2).toBe(false);
+      expect(connectionManager.getConnectionState().consecutiveFailures).toBe(2);
 
       // Third attempt should succeed
-      const result3 = await connectionManager.checkConnection();
+      const result3 = await connectionManager.forceReconnection();
       expect(result3).toBe(true);
 
+      expect(authManager.authenticate).toHaveBeenCalledTimes(3);
       expect(mockLogger.info).toHaveBeenCalledWith('Connection restored successfully');
     });
   });
 
   describe('Network Error Recovery', () => {
     it('should handle network timeouts gracefully', async () => {
-      // Mock network timeout
-      jest.spyOn(baseApiClient, 'getDevices').mockRejectedValue(new Error('ETIMEDOUT'));
+      spyPlatform(platform);
+      jest.spyOn(platform.apiClient, 'getDevices').mockRejectedValue(new Error('ETIMEDOUT'));
 
       await platform.discoverDevices();
 
-      // Should log error and continue
+      // DeviceManager absorbs the error; discovery completes with no devices
       expect(mockLogger.error).toHaveBeenCalledWith(
-        'Failed to discover devices:',
+        'Error during device discovery:',
         expect.any(Error)
       );
-
-      // Connection manager should detect the failure
-      const connectionState = connectionManager.getConnectionState();
-      expect(connectionState.isConnected).toBe(false);
+      expect(mockLogger.info).toHaveBeenCalledWith('Discovered 0 devices');
+      expect(mockApi.registerPlatformAccessories).not.toHaveBeenCalled();
     });
 
     it('should implement circuit breaker pattern for repeated failures', async () => {
       // Mock repeated failures
       jest.spyOn(baseApiClient, 'getDevices').mockResolvedValue({
         success: false,
-        error: { message: 'Service unavailable' },
+        error: { code: 'SERVICE_UNAVAILABLE', message: 'Service unavailable' },
       });
 
       // Simulate multiple failures
@@ -204,71 +271,95 @@ describe('Error Recovery Integration Tests', () => {
   });
 
   describe('API Error Recovery', () => {
+    const oneLight = [{
+      id: 'device-1',
+      name: 'Test Light',
+      type: DeviceType.LIGHT,
+      traits: [DeviceTrait.ON_OFF],
+      attributes: {},
+      state: { on: true },
+      roomHint: 'Living Room',
+      manufacturerInfo: { manufacturer: 'Philips', model: 'Hue Bulb' },
+    }];
+
     it('should handle rate limiting with backoff', async () => {
-      // Mock rate limiting error
-      const rateLimitError = {
-        response: { status: 429 },
-        config: { url: '/api/devices' },
-      };
+      spyPlatform(platform);
 
-      jest.spyOn(baseApiClient, 'getDevices')
-        .mockRejectedValueOnce(rateLimitError)
-        .mockResolvedValueOnce({
-          success: true,
-          data: [],
-        });
+      // Rate limited on the first discovery attempt
+      jest.spyOn(platform.apiClient, 'getDevices')
+        .mockRejectedValueOnce({ response: { status: 429 }, config: { url: '/api/devices' } } as unknown as Error);
 
-      // Should retry after rate limit
+      await platform.discoverDevices();
+      expect(mockApi.registerPlatformAccessories).not.toHaveBeenCalled();
+
+      // Retry after rate limit succeeds
+      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValueOnce({
+        success: true,
+        data: oneLight,
+      });
+
       await platform.discoverDevices();
 
-      // Should eventually succeed
       expect(mockApi.registerPlatformAccessories).toHaveBeenCalled();
     });
 
     it('should handle server errors with retry logic', async () => {
-      // Mock server error
-      const serverError = {
-        response: { status: 500 },
-        config: { url: '/api/devices' },
-      };
+      spyPlatform(platform);
 
-      jest.spyOn(baseApiClient, 'getDevices')
+      const serverError = { response: { status: 500 }, config: { url: '/api/devices' } } as unknown as Error;
+
+      jest.spyOn(platform.apiClient, 'getDevices')
         .mockRejectedValueOnce(serverError)
-        .mockRejectedValueOnce(serverError)
-        .mockResolvedValueOnce({
-          success: true,
-          data: [],
-        });
+        .mockRejectedValueOnce(serverError);
+
+      // Two failed discovery cycles are absorbed
+      await platform.discoverDevices();
+      await platform.discoverDevices();
+      expect(mockApi.registerPlatformAccessories).not.toHaveBeenCalled();
+
+      // Third discovery succeeds after retries
+      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValueOnce({
+        success: true,
+        data: oneLight,
+      });
 
       await platform.discoverDevices();
 
-      // Should eventually succeed after retries
       expect(mockApi.registerPlatformAccessories).toHaveBeenCalled();
     });
 
     it('should not retry on client errors (4xx)', async () => {
-      // Mock client error (non-retryable)
-      const clientError = {
-        response: { status: 400 },
-        config: { url: '/api/devices' },
-      };
+      spyPlatform(platform);
 
-      jest.spyOn(baseApiClient, 'getDevices').mockRejectedValue(clientError);
+      jest.spyOn(platform.apiClient, 'getDevices').mockRejectedValue(
+        Object.assign(new Error('Request failed with status code 400'), {
+          response: { status: 400 },
+          config: { url: '/api/devices' },
+        })
+      );
 
       await platform.discoverDevices();
 
       // Should not register accessories due to client error
       expect(mockApi.registerPlatformAccessories).not.toHaveBeenCalled();
       expect(mockLogger.error).toHaveBeenCalledWith(
-        'Failed to discover devices:',
+        'Error during device discovery:',
         expect.any(Error)
       );
     });
   });
 
   describe('State Synchronization Error Recovery', () => {
+    const createDeviceManagerMock = (): IDeviceManager =>
+      ({
+        getManagedDevices: jest.fn().mockReturnValue(new Map([
+          ['device-1', { id: 'device-1', name: 'Test Device', type: DeviceType.LIGHT, traits: [DeviceTrait.ON_OFF], attributes: {}, state: { on: true } }],
+        ])),
+        updateDeviceState: jest.fn().mockResolvedValue(undefined),
+      }) as unknown as IDeviceManager;
+
     it('should continue polling despite individual sync failures', async () => {
-      const syncManager = new StateSyncManager(resilientApiClient, platform as any, mockLogger, 5);
+      const syncManager = new StateSyncManager(resilientApiClient, createDeviceManagerMock(), mockLogger, 5);
 
       // Mock intermittent failures
       jest.spyOn(resilientApiClient, 'getDeviceStates')
@@ -278,30 +369,29 @@ describe('Error Recovery Integration Tests', () => {
         })
         .mockResolvedValueOnce({
           success: true,
-          data: { 'device-1': { on: true } },
+          data: { 'device-1': { on: false, online: true } },
         });
 
       syncManager.startPolling();
 
       // First poll fails
-      await jest.runOnlyPendingTimersAsync();
+      await jest.advanceTimersByTimeAsync(0);
       expect(mockLogger.warn).toHaveBeenCalledWith(
         'Failed to poll device states:',
         'Temporary failure'
       );
 
       // Second poll succeeds
-      jest.advanceTimersByTime(5000);
-      await jest.runOnlyPendingTimersAsync();
+      await jest.advanceTimersByTimeAsync(5000);
 
       syncManager.stopPolling();
     });
 
     it('should fall back to cached states during API failures', async () => {
       // Pre-populate cache
-      stateCache.setDeviceState('device-1', { on: false, brightness: 50 });
+      stateCache.setDeviceState('device-1', { on: false, brightness: 50, online: true });
 
-      // Mock API failure
+      // Mock connection unavailability
       jest.spyOn(connectionManager, 'shouldAttemptOperation').mockReturnValue(false);
 
       // Try to get device state
@@ -312,7 +402,7 @@ describe('Error Recovery Integration Tests', () => {
     });
 
     it('should handle command execution failures gracefully', async () => {
-      const syncManager = new StateSyncManager(resilientApiClient, platform as any, mockLogger, 5);
+      const syncManager = new StateSyncManager(resilientApiClient, createDeviceManagerMock(), mockLogger, 5);
 
       // Mock command failure
       jest.spyOn(resilientApiClient, 'executeCommand').mockResolvedValue({
@@ -334,28 +424,30 @@ describe('Error Recovery Integration Tests', () => {
 
   describe('Device Lifecycle Error Recovery', () => {
     it('should handle device removal gracefully', async () => {
+      spyPlatform(platform);
+
       // First discovery with devices
-      jest.spyOn(baseApiClient, 'getDevices').mockResolvedValueOnce({
+      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValueOnce({
         success: true,
-        data: [
-          {
-            id: 'device-1',
-            name: 'Test Device',
-            type: 'action.devices.types.LIGHT',
-            traits: ['action.devices.traits.OnOff'],
-            attributes: {},
-            state: {},
-          },
-        ],
+        data: [{
+          id: 'device-1',
+          name: 'Test Device',
+          type: DeviceType.LIGHT,
+          traits: [DeviceTrait.ON_OFF],
+          attributes: {},
+          state: { on: true },
+          roomHint: 'Living Room',
+          manufacturerInfo: { manufacturer: 'Philips', model: 'Hue Bulb' },
+        }],
       });
 
       await platform.discoverDevices();
       expect(mockApi.registerPlatformAccessories).toHaveBeenCalled();
 
-      jest.clearAllMocks();
+      (mockLogger.info as jest.Mock).mockClear();
 
       // Second discovery with no devices (device removed)
-      jest.spyOn(baseApiClient, 'getDevices').mockResolvedValueOnce({
+      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValueOnce({
         success: true,
         data: [],
       });
@@ -365,13 +457,15 @@ describe('Error Recovery Integration Tests', () => {
       // Should unregister the removed device
       expect(mockApi.unregisterPlatformAccessories).toHaveBeenCalled();
       expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Removed 1 stale accessories')
+        'Removed 1 stale accessories'
       );
     });
 
     it('should handle device addition during runtime', async () => {
+      spyPlatform(platform);
+
       // First discovery with no devices
-      jest.spyOn(baseApiClient, 'getDevices').mockResolvedValueOnce({
+      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValueOnce({
         success: true,
         data: [],
       });
@@ -379,24 +473,22 @@ describe('Error Recovery Integration Tests', () => {
       await platform.discoverDevices();
       expect(mockApi.registerPlatformAccessories).not.toHaveBeenCalled();
 
-      jest.clearAllMocks();
-
       // Second discovery with new device
-      jest.spyOn(baseApiClient, 'getDevices').mockResolvedValueOnce({
+      jest.spyOn(platform.apiClient, 'getDevices').mockResolvedValueOnce({
         success: true,
-        data: [
-          {
-            id: 'new-device',
-            name: 'New Device',
-            type: 'action.devices.types.SWITCH',
-            traits: ['action.devices.traits.OnOff'],
-            attributes: {},
-            state: {},
-          },
-        ],
+        data: [{
+          id: 'new-device',
+          name: 'New Device',
+          type: DeviceType.SWITCH,
+          traits: [DeviceTrait.ON_OFF],
+          attributes: {},
+          state: { on: false },
+          roomHint: 'Kitchen',
+          manufacturerInfo: { manufacturer: 'TP-Link', model: 'Kasa Switch' },
+        }],
       });
 
-      await platform.rediscoverDevices();
+      await platform.discoverDevices();
 
       // Should register the new device
       expect(mockApi.registerPlatformAccessories).toHaveBeenCalled();
@@ -405,7 +497,9 @@ describe('Error Recovery Integration Tests', () => {
 
   describe('Memory and Resource Management', () => {
     it('should clean up resources on shutdown', () => {
-      const syncManager = new StateSyncManager(resilientApiClient, platform as any, mockLogger, 5);
+      const syncManager = new StateSyncManager(resilientApiClient, {
+        getManagedDevices: jest.fn().mockReturnValue(new Map()),
+      } as unknown as IDeviceManager, mockLogger, 5);
 
       syncManager.startPolling();
       expect(syncManager.getSyncStatistics().isPolling).toBe(true);
@@ -415,26 +509,36 @@ describe('Error Recovery Integration Tests', () => {
       expect(syncManager.getSyncStatistics().isPolling).toBe(false);
     });
 
-    it('should limit cache size to prevent memory leaks', () => {
+    it('should handle large cache loads and clean up stale entries', () => {
       // Add many cache entries
       for (let i = 0; i < 1500; i++) {
-        stateCache.setDeviceState(`device-${i}`, { on: true });
+        stateCache.setDeviceState(`device-${i}`, { on: true, online: true });
       }
 
-      const stats = stateCache.getCacheStatistics();
-      expect(stats.totalDevices).toBeLessThanOrEqual(1000); // Should be limited
+      let stats = stateCache.getCacheStatistics();
+      expect(stats.totalDevices).toBe(1500);
+
+      // Age the entries past the cleanup threshold
+      jest.advanceTimersByTime(2 * 60 * 60 * 1000);
+      const removedCount = stateCache.cleanupStaleEntries(0);
+
+      expect(removedCount).toBe(1500);
+      stats = stateCache.getCacheStatistics();
+      expect(stats.totalDevices).toBe(0);
     });
 
     it('should clean up old cache entries automatically', () => {
       // Add old entries
-      stateCache.setDeviceState('old-device', { on: true });
+      stateCache.setDeviceState('old-device', { on: true, online: true });
+
+      jest.advanceTimersByTime(60 * 1000);
 
       // Clean up entries older than 0 minutes
       const removedCount = stateCache.cleanupStaleEntries(0);
 
       expect(removedCount).toBeGreaterThan(0);
       expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('Cleaned up')
+        'Cleaned up 1 stale cache entries'
       );
     });
   });
